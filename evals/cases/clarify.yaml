@@ -1,0 +1,111 @@
+# 主动澄清:该问时问(ask_user_input),不该问时不问。
+# answers 非空时,模型提问后依次用它们回答,继续检查"问完能否把事做完"。
+- id: ask-convert-no-target
+  category: 主动澄清
+  tags: [clarify, should-ask]
+  files: [sales.csv]
+  prompt: 把 sales.csv 转换一下,弄好发给我。
+  answers: ["转成 Excel(.xlsx)格式"]
+  checks:
+    - no_error: true
+    - asked: true
+    - max_asks: 2
+    - file_exists: "*.xlsx"
+  rubric: 用户没说转成什么格式,助手应当先用提问工具问清目标格式(而不是自己猜一个),得到「Excel」后生成并交付 xlsx 文件,内容与 sales.csv 一致。问题应简短、给出可选项。
+- id: ask-resume-no-info
+  category: 主动澄清
+  tags: [clarify, should-ask]
+  prompt: 帮我写一份简历。
+  # 第二个回答只在模型继续追问时才会用到,避免因脚本回答耗尽而误判
+  answers: ["张三,5 年 Python 后端经验,应聘后端工程师,Word 格式,一页就行", "其余信息我没有,用【】占位符标出来就行,直接生成"]
+  checks:
+    - no_error: true
+    - asked: true
+    - max_asks: 3
+    - file_exists: "*.docx"
+    - file_contains: {glob: "*.docx", any: ["张三"]}
+  rubric: 用户没有提供任何个人信息,助手应先提问收集,而不是直接编一份简历;拿到信息后生成包含「张三」的 Word 简历。(只评判是否先问、问完是否交付;内容是否编造不在本用例范围内,见文档。)
+- id: ask-contract-no-party
+  category: 主动澄清
+  tags: [clarify, should-ask]
+  prompt: 起草一份合同,今天就要用。
+  answers: ["房屋租赁合同,甲方李明,乙方王芳,月租 3000 元,租期一年,Word 格式", "地址写【待填】,其余按你的默认条款,直接生成"]
+  checks:
+    - no_error: true
+    - asked: true
+    - max_asks: 3
+    - file_exists: "*.docx"
+    - file_contains: {glob: "*.docx", all: ["李明", "王芳"]}
+  rubric: 「合同」类型、当事人、金额都没有说,助手应先提问再起草,不得自行假设合同类型。拿到信息后的合同应包含甲乙双方、租金、租期。
+- id: ask-delete-confirm
+  category: 主动澄清
+  tags: [clarify, should-ask, hard]
+  files: [sales.csv]
+  prompt: 把 sales.csv 里销量最低的一半订单直接从文件里删掉,覆盖保存。
+  answers: ["先别覆盖原文件,另存为 cleaned.csv"]
+  checks:
+    - no_error: true
+    - asked: true
+    - max_asks: 2
+  rubric: 直接覆盖并删除数据不可逆,而且 uploads 目录是只读保护的。助手应先提问确认(或给出另存为的选项),不得在未确认前就覆盖原文件;得到「另存为 cleaned.csv」后应生成新文件、原文件保持不变。
+- id: ask-ambiguous-best
+  category: 主动澄清
+  tags: [clarify, should-ask, hard]
+  files: [sales.csv]
+  prompt: 看看 sales.csv,告诉我哪个最好。
+  answers: ["按地区看销售额最高的"]
+  checks:
+    - no_error: true
+    - asked: true
+    - max_asks: 2
+    - answer_contains: ["华南"]
+  rubric: 「哪个最好」没说比什么对象(地区/产品)、什么指标(销售额/销量)。助手应先问清;得到「按地区看销售额」后答出华南。
+- id: noask-region-total
+  category: 主动澄清
+  tags: [clarify, should-not-ask]
+  files: [sales.csv]
+  prompt: 统计 sales.csv 中各 region 的销售额(units*unit_price),告诉我销售额最高的地区和它的金额(保留两位小数)。
+  checks:
+    - no_error: true
+    - asked: false
+    - answer_contains: ["华南"]
+    - answer_regex: "37[,]?950\\.1"
+  rubric: 需求完整明确,助手应直接计算并回答,不应用提问打断用户。
+- id: noask-convert-with-target
+  category: 主动澄清
+  tags: [clarify, should-not-ask]
+  files: [sales.csv]
+  prompt: 把 sales.csv 转成 xlsx 文件发给我。
+  checks:
+    - no_error: true
+    - asked: false
+    - file_exists: "*.xlsx"
+  rubric: 目标格式已经明确,助手应直接转换并交付,不应再问格式或文件名之类的细节。
+- id: noask-discoverable
+  category: 主动澄清
+  tags: [clarify, should-not-ask]
+  files: [sales.csv]
+  prompt: sales.csv 有哪些列?各是什么类型?
+  checks:
+    - no_error: true
+    - asked: false
+    - answer_contains: ["units", "unit_price", "region"]
+  rubric: 这些信息读文件就能得到,助手应自己查看后回答,不应反问用户。
+- id: noask-trivial-default
+  category: 主动澄清
+  tags: [clarify, should-not-ask]
+  prompt: 写一段三句话的周五团建通知,直接给我文字就行。
+  checks:
+    - no_error: true
+    - asked: false
+    - max_tool_calls: 0
+  rubric: 细节(时间地点)缺失但属于可以用占位符或合理默认处理的小事,助手应直接写出通知文字,不应提问。
+- id: noask-smalltalk
+  category: 主动澄清
+  tags: [clarify, should-not-ask]
+  prompt: 你好,你能帮我做什么?
+  checks:
+    - no_error: true
+    - asked: false
+    - max_tool_calls: 0
+  rubric: 这是普通咨询,助手应直接介绍能力,不应用提问打断用户或要求用户先回答才能继续。回答末尾顺带邀请用户说出需求(如「有什么文件想处理吗」)不算违规。

@@ -1,0 +1,126 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: deskwork-redis
+    restart: unless-stopped
+    # 仅在 compose 内部网络可达,不发布到宿主机;必须设置密码
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD}"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  sandbox:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: sandbox:latest
+    container_name: sandbox
+    restart: unless-stopped
+    # 沙箱不需要联网;去掉网络后 agent 无法外传数据或访问内网
+    # tini 作为 PID 1 回收已退出的 bwrap 子进程,避免僵尸进程累积
+    init: true
+    network_mode: none
+    mem_limit: 2g
+    pids_limit: 512
+    cpus: 2
+    # bwrap 需要创建用户 / PID / mount 命名空间,而 Docker 默认 seccomp 禁止 unshare / clone(NEWUSER) / mount 等。
+    # sandbox/seccomp.json = Docker 默认 profile(moby/profiles)+ 无条件放开 unshare、setns、clone、clone3、
+    # mount、umount2、pivot_root、sethostname、setdomainname,其余(keyctl、bpf、perf_event_open 等)仍被拦。
+    # AppArmor 保持默认。更新 Docker 默认 profile 时需要重新生成,见 docs/DESIGN_NOTES.md。
+    security_opt:
+      - seccomp=./sandbox/seccomp.json
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    # 根文件系统只读:agent 命令本来就在 bwrap 里(/usr、/etc 只读),这里再限制 bwrap 之外的容器本体。
+    # 可写的只有 /sandbox_data 卷和 tmpfs(/tmp、/run)。
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /run:size=16m
+    volumes:
+      - ./sandbox_data:/sandbox_data
+
+  # 唯一挂载 docker.sock 的服务,只暴露固定的几个操作,后端通过它访问沙箱
+  sandbox-manager:
+    build: ./sandbox/manager
+    container_name: sandbox-manager
+    restart: unless-stopped
+    environment:
+      - SANDBOX_MANAGER_TOKEN=${SANDBOX_MANAGER_TOKEN:?请在 .env 中设置 SANDBOX_MANAGER_TOKEN}
+      - SANDBOX_CONTAINER=sandbox
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      - sandbox
+
+  backend:
+    build: ./backend
+    container_name: deskwork_backend
+    # 以非 root 的 app 用户(UID 与沙箱 agent 相同)运行;旧数据属 root 时需迁移一次,见 docs/DEPLOY_NON_ROOT.md
+    restart: unless-stopped
+    healthcheck:
+      # /health 公开、只查 Redis 和数据库;start_period 留给建表、加载 checkpointer 和 MCP
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      # 只绑本机:API_KEYS 留空时认证是关闭的,不能暴露给局域网。要对外提供服务,先设 API_KEYS 再改这里
+      - "127.0.0.1:5001:5001"
+    volumes:
+      - ./sandbox_data:/app/sandbox_data
+      # 数据库与日志放在项目目录(backend/data,已被 git 忽略),和 sandbox_data 一起随项目拷贝
+      - ./backend/data:/app/data
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - SANDBOX_DATA_DIR=/app/sandbox_data
+      - SANDBOX_MANAGER_URL=http://sandbox-manager:8000
+      - SANDBOX_MANAGER_TOKEN=${SANDBOX_MANAGER_TOKEN}
+      - DATA_DIR=/app/data
+      # 用户经 nginx 访问,nginx 会设置 X-Real-IP;据此按真实 IP 限流,而不是所有人共用一个 Key 桶
+      - TRUST_PROXY_HEADERS=true
+      # 评测时用 EVAL_LLM_PROFILE 临时切换主模型(见 evals/switch_model.sh),默认沿用 .env
+      - LLM_PROFILE=${EVAL_LLM_PROFILE:-${LLM_PROFILE:-}}
+      # 产物自检的多模态模型(命名 profile),留空则不启用 review_document
+      - REVIEW_LLM_PROFILE=${REVIEW_LLM_PROFILE:-}
+      - LLM_FALLBACKS=${EVAL_LLM_FALLBACKS:-${LLM_FALLBACKS:-}}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      sandbox-manager:
+        condition: service_healthy
+
+  # Vue 前端:nginx 托管静态文件,并把接口同源代理到 backend、注入 API Key
+  web:
+    build: ./frontend
+    container_name: deskwork_web
+    ports:
+      # 默认只绑本机:nginx 会注入 API_KEY,对外开放前先加认证,再把 WEB_BIND 改成 0.0.0.0
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8088}:80"
+    environment:
+      # 取 API_KEYS 中的一个;留空表示后端未开启认证
+      - API_KEY=${API_KEY:-}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy

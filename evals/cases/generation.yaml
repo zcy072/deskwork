@@ -1,0 +1,40 @@
+- id: gen-docx-report
+  category: 文档生成
+  prompt: 写一份 Word 文档《远程办公制度》,包含目的、适用范围、考勤要求、保密要求四个章节,保存为 remote_work.docx。
+  checks:
+    - no_error: true
+    - file_exists: "*.docx"
+    - file_contains: {glob: "*.docx", all: ["目的", "适用范围", "考勤", "保密"]}
+  rubric: 文档应有清晰的四个章节,每章有实质内容(不是只有标题),语言为中文且通顺。
+- id: gen-pptx-intro
+  category: 文档生成
+  prompt: 做一个 5 页左右的 PPT 介绍“向量数据库”,包含它是什么、典型应用、与传统数据库的区别,保存为 vecdb.pptx。
+  checks:
+    - no_error: true
+    - file_exists: "*.pptx"
+    - file_contains: {glob: "*.pptx", any: ["向量", "vector"]}
+  rubric: 页数大致 4-7 页,内容涵盖定义、应用、与传统数据库区别三点,没有明显事实错误。
+- id: gen-xlsx-budget
+  category: 文档生成
+  prompt: 创建一个 Excel 预算表 budget.xlsx,列为 项目、预算、实际,填 4 行示例数据,并在最后一行用公式求和。
+  checks:
+    - no_error: true
+    - file_exists: "*.xlsx"
+    - file_contains: {glob: "*.xlsx", any: ["SUM", "sum("]}
+  rubric: 表格有表头和 4 行数据,最后一行是求和公式而不是写死的数字。
+- id: gen-pdf-notice
+  category: 文档生成
+  prompt: 生成一份一页的 PDF 通知《春节放假安排》,保存为 notice.pdf,内容自拟但要合理。
+  checks:
+    - no_error: true
+    - file_exists: "*.pdf"
+    - file_magic: {glob: "*.pdf", prefix: "%PDF"}
+  rubric: PDF 是一页的通知,有标题和放假安排正文。
+- id: gen-md-readme
+  category: 文档生成
+  prompt: 写一个 Markdown 格式的项目 README 草稿,项目叫 TinyQueue,是一个 Python 内存任务队列,保存为 README.md。
+  checks:
+    - no_error: true
+    - file_exists: "README.md"
+    - file_contains: {glob: "README.md", all: ["TinyQueue"]}
+  rubric: README 包含项目简介、安装、使用示例至少两个部分。

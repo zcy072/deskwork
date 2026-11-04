@@ -1,0 +1,37 @@
+# 排版压力用例:容易出现表格挤压、溢出的需求。用 --layout 跑,由 layout.py 渲染后评分,
+# 用来对照"开启产物自检(REVIEW_LLM_PROFILE)"前后的排版合格率。规则检查只确认文件存在。
+- id: lay-docx-wide-table
+  category: 排版
+  tags: [layout]
+  prompt: 生成 Word 文档 sales_matrix.docx:标题《2024 年各区域季度销售明细》,一张表,列为 区域、负责人、Q1 销售额、Q1 回款、Q2 销售额、Q2 回款、Q3 销售额、Q3 回款、Q4 销售额、Q4 回款、全年合计、备注,共 8 行示例数据(区域自拟,数字合理),备注列要有一句较长的说明。
+  checks:
+    - no_error: true
+    - file_exists: "*.docx"
+- id: lay-docx-long-cells
+  category: 排版
+  tags: [layout]
+  prompt: 生成 Word 文档 risk_register.docx:《项目风险登记表》,表格列为 编号、风险描述、影响、可能性、应对措施、负责人、截止日期,共 6 条风险,风险描述和应对措施每条写 40 字以上。
+  checks:
+    - no_error: true
+    - file_exists: "*.docx"
+- id: lay-pptx-dense
+  category: 排版
+  tags: [layout]
+  prompt: 做一个 6 页的 PPT roadmap.pptx,主题《2025 产品路线图》,每页包含标题和 4~5 条要点(每条要点 20 字以上),其中一页放一张含 5 列 4 行的对比表。
+  checks:
+    - no_error: true
+    - file_exists: "*.pptx"
+- id: lay-xlsx-wide
+  category: 排版
+  tags: [layout]
+  prompt: 创建 Excel 文件 kpi.xlsx:列为 部门、指标名称、指标说明、目标值、实际值、完成率、负责人、备注,填 10 行示例数据,指标说明写得较长,完成率用公式,并设置合适的列宽和表头样式。
+  checks:
+    - no_error: true
+    - file_exists: "*.xlsx"
+- id: lay-pdf-table
+  category: 排版
+  tags: [layout]
+  prompt: 生成 PDF 文件 inventory.pdf:《库存盘点表》,列为 SKU、商品名称、规格、仓库、库存数量、单价、库存金额、最近入库日期、备注,共 15 行示例数据,需要能完整显示在 A4 纸上,可以分多页。
+  checks:
+    - no_error: true
+    - file_exists: "*.pdf"

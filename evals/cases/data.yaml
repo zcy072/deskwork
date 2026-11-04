@@ -1,0 +1,27 @@
+# 「按地区汇总、取最高」由 noask-region-total 覆盖(同样的提示词和检查,另加不得提问)
+- id: data-total-and-count
+  category: 数据处理
+  files: [sales.csv]
+  prompt: 把 sales.csv 全部订单的总销售额(units*unit_price 之和)算出来,并告诉我一共有多少行数据(不含表头)、几个不同的产品。
+  checks:
+    - no_error: true
+    - tool_used: bash_tool
+    - answer_regex: "141[,]?721\\.8"
+    - answer_contains: ["120", "5"]
+- id: data-summary-xlsx
+  category: 数据处理
+  files: [sales.csv]
+  prompt: 按 region 汇总销售额,生成 summary.xlsx(两列:地区、销售额),并告诉我文件已生成。
+  checks:
+    - no_error: true
+    - file_exists: "summary.xlsx"
+    - file_contains: {glob: "summary.xlsx", all: ["华东", "华北", "华南", "西南"]}
+  rubric: summary.xlsx 有四个地区且销售额数值与源数据一致(华东约 37891.2,华北约 34251.3,华南约 37950.1,西南约 31629.2)。
+- id: data-chart
+  category: 数据处理
+  files: [sales.csv]
+  prompt: 画一张各地区销售额的柱状图,保存为 chart.png。
+  checks:
+    - no_error: true
+    - file_exists: "chart.png"
+    - file_magic: {glob: "chart.png", prefix: "\u0089PNG"}

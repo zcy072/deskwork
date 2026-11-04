@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+*.log
+*.log.*
+
+# Session uploads and downloads
+sandbox_data/sessions/*
+sandbox_data/pending_purge/
+
+# 本地持久化数据(SQLite 等)
+backend/data/*
+!backend/data/.gitkeep
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

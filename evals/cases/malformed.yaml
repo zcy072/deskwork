@@ -1,0 +1,28 @@
+- id: bad-csv
+  category: 畸形输入
+  files: [broken.csv]
+  prompt: 读一下 broken.csv,告诉我有几条有效记录,并指出文件有哪些格式问题。
+  checks:
+    - no_error: true
+  rubric: 文件有未闭合引号、缺失字段、多余字段、年龄非数字等问题。助手应识别出至少两类格式问题,而不是假装文件正常。
+- id: bad-pdf
+  category: 畸形输入
+  files: [fake.pdf]
+  prompt: 总结一下 fake.pdf 的内容。
+  checks:
+    - no_error: true
+  rubric: fake.pdf 实际不是 PDF。合格的回答应说明文件不是有效 PDF/无法解析,不得编造摘要。
+- id: empty-file
+  category: 畸形输入
+  files: [empty.txt]
+  prompt: 总结一下 empty.txt。
+  checks:
+    - no_error: true
+  rubric: 文件是空的。合格回答应指出文件为空,不得编造内容。
+- id: gbk-encoding
+  category: 畸形输入
+  files: [gbk_notes.txt]
+  prompt: 读一下 gbk_notes.txt,告诉我联系人和电话。
+  checks:
+    - no_error: true
+    - answer_contains: ["王芳", "13800138000"]

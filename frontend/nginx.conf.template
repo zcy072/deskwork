@@ -1,0 +1,81 @@
+# 由官方 nginx 镜像在启动时用 envsubst 渲染(只替换已定义的环境变量,不影响 $host 等 nginx 变量)
+# 浏览器自带 Authorization(用户在页面里填了自己的 Key)就原样转发;没有才注入 API_KEY 作为默认身份
+map $http_authorization $backend_authorization {
+    default $http_authorization;
+    "" "Bearer ${API_KEY}";
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # 文本类资源压缩传输(SSE 的 text/event-stream 不在列表里,不会被缓冲)
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_types text/css application/javascript text/javascript application/json image/svg+xml;
+
+    # 上传文件走 /send-message,放宽请求体上限
+    client_max_body_size 100m;
+
+    # 会话备份导入:后端允许约 1.25GB 的备份包(session_import.MAX_ARCHIVE_BYTES),这里同步放宽,
+    # 否则导出成功的大会话会在导入时被 nginx 直接 413。精确匹配优先于下面的正则 location。
+    location = /conversations/import {
+        client_max_body_size 1300m;
+        proxy_pass http://backend:5001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Connection "";
+        proxy_set_header Authorization $backend_authorization;
+        proxy_set_header X-API-Key "";
+        proxy_request_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    # 后端接口:同源代理,API_KEY 非空时给没带 Key 的请求注入默认身份(单用户部署);多用户部署留空,每人在页面里填自己的 Key
+    location ~ ^/(send-message|stream-events|thread-status|thread-cancel|files|conversations|memories|capabilities|health)(/|$) {
+        proxy_pass http://backend:5001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Connection "";
+        proxy_set_header Authorization $backend_authorization;
+        proxy_set_header X-API-Key "";
+
+        # SSE:关闭缓冲,否则 token 会被攒到一起才推给浏览器
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # 页面级 CSP。WidgetFrame 的 srcdoc iframe 会继承它(再与自带的 meta CSP 取交集),
+    # 所以 script-src/style-src 必须放行 widget 需要的内联脚本和白名单 CDN,不能收紧到 'self';
+    # 这里主要限制外传通道(connect/img/form/base/object/frame-ancestors)。
+    # naive-ui 运行时注入 <style>,style-src 需要 'unsafe-inline'。
+    # frame-src blob: 用于 PDF 预览;worker/media 不用,收到 'none'。
+    add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; font-src 'self' data: https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; img-src 'self' data: blob:; connect-src 'self'; frame-src blob: about:; form-action 'none'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    # 下面 location 里的 add_header 默认会整体替换上面这几条安全头;merge 让它们叠加(nginx ≥ 1.29.3)
+    add_header_inherit merge;
+
+    # 单页应用:未知路径回退到 index.html。index.html 每次都要验证,否则重新构建后旧页面会引用已不存在的 hash 资源
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache";
+    }
+
+    # 带 hash 的静态资源可长期缓存
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+}

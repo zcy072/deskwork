@@ -1,0 +1,35 @@
+# Virtual environments (host .venv overwrites image venv and breaks shebangs)
+.venv/
+venv/
+
+# Git and local tooling
+.git/
+.gitignore
+.cursor/
+
+# Secrets and local env (injected via env_file at runtime)
+.env
+.env.*
+!.env.example
+
+# Python artifacts
+__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+wheels/
+
+# Runtime / local data
+data/
+*.sqlite*
+tests/
+.pytest_cache/
+.ruff_cache/
+*.log
+sandbox_data/
+
+# Docs and misc not needed in the image
+README.md
+LICENSE
+images/

@@ -1,0 +1,33 @@
+- id: multi-analyze-and-report
+  category: 多步任务
+  files: [sales.csv]
+  prompt: 分析 sales.csv:先找出销量(units)最高的产品,再生成一份 Word 报告 analysis.docx,包含结论和一张汇总表。
+  checks:
+    - no_error: true
+    - file_exists: "analysis.docx"
+    - tool_used: bash_tool
+  rubric: 报告结论中的“销量最高产品”必须与 sales.csv 实际数据一致(请根据回答自洽性判断),并包含汇总表。
+- id: multi-todo-plan
+  category: 多步任务
+  files: [sales.csv]
+  prompt: 请分三步完成:1) 统计各产品总销量;2) 把结果写入 products.csv;3) 再基于 products.csv 生成一页 PDF 摘要 products.pdf。
+  checks:
+    - no_error: true
+    - file_exists: "products.csv"
+    - file_exists: "products.pdf"
+- id: multi-convert-chain
+  category: 多步任务
+  files: [sales.csv]
+  prompt: 把 sales.csv 转成 xlsx(sales.xlsx),然后再根据这个 xlsx 告诉我华北地区一共有多少条订单。
+  checks:
+    - no_error: true
+    - file_exists: "sales.xlsx"
+    - answer_contains: ["30"]
+- id: multi-efficiency
+  category: 多步任务
+  prompt: 在输出目录创建文件 hello.txt,内容是“你好,世界”。并交付给我,完成后简短告诉我即可。
+  checks:
+    - no_error: true
+    - file_exists: "hello.txt"
+    - file_contains: {glob: "hello.txt", all: ["你好,世界"]}
+    - max_tool_calls: 4
