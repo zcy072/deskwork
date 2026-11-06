@@ -172,7 +172,7 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        return self.DATABASE_URL or f"sqlite+aiosqlite:///{self.data_dir / 'workmate.sqlite'}"
+        return self.DATABASE_URL or f"sqlite+aiosqlite:///{self.data_dir / 'deskwork.sqlite'}"
 
     @property
     def checkpoint_db_path(self) -> Path:
