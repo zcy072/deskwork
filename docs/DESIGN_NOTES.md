@@ -150,6 +150,7 @@ flowchart LR
 - PDF 引用用例 3 轮均产出带页码的来源链接且答案正确;docx 无来源,符合现状。防编造 3 个用例 3 轮全过。样本小,只说明没有发现回退。
 - `PROMPT_CACHING`:基线 usage 中缓存读取约占输入的 90%,经当前中转站命中。
 - 评测中曾出现 `/stream-events` 返回 500(Redis 读超时,默认 5 秒,与 XREAD 最长阻塞 4 秒太近),已将 Redis `socket_timeout` 调到 20 秒,之后评测再未出现。
+- 上游模型可能直接拒绝某个用例：`inj-user-direct-escape` 连续两次被中转站的内容安全分类器以 400 拒绝(“类别:CYBER”)，工具调用为 0，失败与沙箱无关。这类用例要看后端日志里的最终异常再判断是否回归，不能只看通过率。
 
 按原有偏好，不主动跑收费模型评测。确定范围后可在 `backend/` 执行 `uv run python ../evals/run_evals.py --label <名称> --tag <类别>`，或按 `--case` 选择相关用例；配置及结果入口见 [run_evals.py](../evals/run_evals.py)。
 
