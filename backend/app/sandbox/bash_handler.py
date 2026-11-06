@@ -1,48 +1,52 @@
+"""沙箱的业务接口:工具和服务只通过这里操作会话沙箱。
+
+    BashSessionsManager(全局单例 CONTAINER_MANAGER)
+        会话登记与目录准备、空闲 shell 回收、删除会话,以及按 session_id 转发的便捷入口。
+    BashSession(每个会话一个)
+        常驻 shell 的启动 / 串行执行 / 超时 / 取消 / 重启;一次性隔离命令;
+        文件读写(宿主侧经 bind mount);回退快照的创建与恢复。
+
+底层细节不在这里:bwrap 参数见 bwrap.py,宿主侧文件 IO 见 host_files.py,快照脚本见
+snapshots.py,与 sandbox-manager 的 HTTP / WebSocket 通信见 manager_client.py。
+"""
+
 import asyncio
 import hashlib
 import os
 import secrets
 import shlex
 import shutil
-import stat
 import time
 from asyncio import StreamReader
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from app.config import settings
+from app.sandbox import bwrap, host_files
 from app.sandbox.command_validator import CommandValidator
 from app.sandbox.constants import (
     BASH_SENTINEL,
     COMMAND_TIMEOUT_SEC,
-    CONTAINER_AGENT_USER,
-    CONTAINER_DEFAULT_SKILLS,
     CONTAINER_NAME,
     OUTPUT_MAX_LINES,
     SESSION_ROOT,
-    SESSION_SUBDIRS,
     SPILL_MAX_CHARS,
     WRITABLE_SESSION_SUBDIRS,
 )
 from app.sandbox.errors import ContainerFileSystemError
-from app.sandbox.manager_client import ManagerClient, RemoteProcess, _cap_timeout
-from app.sandbox.quota import (
-    MB,
-    SNAPSHOT_EXCLUDED,
-    is_cleanup_command,
-    over_quota_message,
-    session_usage,
-    snapshot_manifest,
-    snapshot_name,
-)
+from app.sandbox.manager_client import ManagerClient, RemoteProcess, cap_timeout
+from app.sandbox.quota import MB, is_cleanup_command, over_quota_message, session_usage
 from app.sandbox.session_paths import SessionPaths
+from app.sandbox.snapshots import (
+    RESTORE_MISSING,
+    restore_script,
+    snapshot_manifest,
+    snapshot_script,
+)
 from app.utils import logger
 
 # 上一条命令结束时测得的会话占用在这么多秒内直接复用,连续执行命令时不必每条都遍历两次目录
 USAGE_CACHE_SEC = 10.0
-
-# 文件工具(view_file、str_replace 等)一次读取的上限;更大的文件用 bash 查看
-MAX_READ_BYTES = 50 * 1024 * 1024
 
 # 单条命令累计输出上限(字节),超过即杀掉 shell,防止 `yes` 之类的命令撑爆后端内存
 MAX_COMMAND_OUTPUT_BYTES = 20 * 1024 * 1024
@@ -57,27 +61,28 @@ class ShellExited(Exception):
 
 
 class BashSession:
-    """Stateful, isolated bash session for a single agent session."""
+    """一个会话的沙箱:常驻 bash(在 bwrap 里)加上该会话目录的文件操作。
+
+    同一会话的命令由 _lock 串行;快照恢复、重置、关闭也持这把锁。shell 按需启动,
+    被回收、取消或出错后下一条命令自动重启,cwd 回到 scratchpad,文件不受影响。
+    """
 
     def __init__(
         self,
         paths: SessionPaths,
         container_name: str = CONTAINER_NAME,
         validator: CommandValidator | None = None,
-        docker_client: ManagerClient | None = None,
-        exec_user: str = CONTAINER_AGENT_USER,
+        manager_client: ManagerClient | None = None,
     ) -> None:
         self.paths = paths
         self.container_name = container_name
         self.validator = validator or CommandValidator()
-        self.docker_client = docker_client or ManagerClient()
-        self.exec_user = exec_user
+        self.manager_client = manager_client or ManagerClient()
         self._lock = asyncio.Lock()
         self._process: RemoteProcess | None = None
         # (label, 行);行为 None 表示该流的读取已结束(EOF 或超出输出上限),用来唤醒等待方
         self._output_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
         self._reader_tasks: list[asyncio.Task] = []
-        self._active_exec_user = exec_user
         self._current_cwd = paths.virtual_scratchpad
         self._spill_count = 0
         self._output_bytes = 0
@@ -97,7 +102,7 @@ class BashSession:
     async def execute(
         self, command: str, timeout: int | None = COMMAND_TIMEOUT_SEC
     ) -> tuple[str, bool]:
-        timeout_sec = _cap_timeout(timeout)
+        timeout_sec = cap_timeout(timeout)
         started = time.monotonic()
         command_digest = hashlib.sha256(command.encode()).hexdigest()[:12]
 
@@ -112,12 +117,12 @@ class BashSession:
                 used = await self._session_usage(reuse=True)
                 if used > quota_limit * MB and not is_cleanup_command(command):
                     return f"Error: {over_quota_message(used, quota_limit)}", True
-            await self._ensure_started(self.exec_user)
+            await self._ensure_started()
             await self._drain_queue()
             self._output_bytes = 0
             self._output_exceeded = False
             wrapped = self._wrap_command(command)
-            await self.docker_client.write_stdin(self._process, wrapped)
+            await self.manager_client.write_stdin(self._process, wrapped)
             try:
                 output, timed_out, cwd = await self._read_until_sentinel(timeout_sec)
             except ShellExited as exc:
@@ -128,7 +133,7 @@ class BashSession:
                     type(exc).__name__,
                 )
                 await self._stop()
-                await self._ensure_started(self._active_exec_user)
+                await self._ensure_started()
                 code = f" (exit code {exc})" if str(exc) not in ("", "None") else ""
                 return (
                     f"Error: The shell exited while running the command{code}; "
@@ -144,7 +149,7 @@ class BashSession:
                     command_digest,
                 )
                 await self._stop()
-                await self._ensure_started(self._active_exec_user)
+                await self._ensure_started()
                 limit_mb = MAX_COMMAND_OUTPUT_BYTES // MB
                 return (
                     f"Error: Output limit exceeded ({limit_mb}MB); the command was killed "
@@ -167,7 +172,7 @@ class BashSession:
                     cwd,
                 )
                 await self._stop()
-                await self._ensure_started(self._active_exec_user)
+                await self._ensure_started()
                 return (
                     f"Error: Working directory escaped session boundary ({cwd})",
                     True,
@@ -213,11 +218,11 @@ class BashSession:
         self._usage = (now, used)
         return used
 
-    async def reset(self, user: str | None = None) -> str:
+    async def reset(self) -> str:
         async with self._lock, self._cleanup_on_cancel():
             await self._stop()
             self._current_cwd = self.paths.virtual_scratchpad
-            await self._ensure_started(user or self.exec_user)
+            await self._ensure_started()
             return "Bash session restarted"
 
     async def save_upload(self, dest_name: str, data: bytes) -> Path:
@@ -228,16 +233,8 @@ class BashSession:
         if ".." in Path(dest_name).parts or Path(dest_name).is_absolute():
             raise ValueError("Invalid destination filename")
         host_dest = self.paths.uploads / dest_name
-        await asyncio.to_thread(self._create_upload, host_dest, data)
+        await asyncio.to_thread(host_files.create_upload, host_dest, data)
         return host_dest
-
-    @staticmethod
-    def _create_upload(host_dest: Path, data: bytes) -> None:
-        host_dest.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(host_dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o665)
-        with os.fdopen(fd, "wb") as fh:
-            os.fchmod(fd, 0o665)  # 不受 umask 影响
-            fh.write(data)
 
     async def close(self) -> None:
         async with self._lock:
@@ -256,7 +253,7 @@ class BashSession:
             await self._stop()
         return True
 
-    # ── Container filesystem operations (raw docker exec as agent user) ──
+    # ── 文件操作:路径先按 agent 视角解析并限制在会话内,再经 bind mount 在宿主侧读写 ──
 
     def resolve_virtual_path(self, raw_path: str) -> str:
         """Resolve an agent path to a virtual /workspace/... path."""
@@ -270,7 +267,7 @@ class BashSession:
         return resolved
 
     def resolve_container_path(self, raw_path: str) -> str:
-        """Resolve an agent path to the physical container path for docker exec."""
+        """Resolve an agent path to the physical container path (/sandbox_data/sessions/...)."""
         virtual_path = self.resolve_virtual_path(raw_path)
         try:
             return self.paths.virtual_to_container_path(virtual_path)
@@ -300,49 +297,19 @@ class BashSession:
 
     async def read_container_file(self, container_path: str, *, strict: bool = False) -> str:
         """strict=True 时非 UTF-8 内容抛 UnicodeDecodeError,供要写回的编辑操作使用。"""
-        data = await asyncio.to_thread(self._read_host_file, container_path)
+        data = await asyncio.to_thread(
+            lambda: host_files.read_regular_file(self._host_path(container_path))
+        )
         return data.decode("utf-8", errors="strict" if strict else "replace")
 
     async def list_directory(self, container_path: str) -> str:
-        return await asyncio.to_thread(self._list_host_dir, container_path)
+        return await asyncio.to_thread(lambda: host_files.list_dir(self._host_path(container_path)))
 
-    def _read_host_file(self, container_path: str) -> bytes:
-        host = self._host_path(container_path)
-        try:
-            # 路径已解析过;O_NOFOLLOW 拒绝解析之后才换上的符号链接
-            fd = os.open(host, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except OSError as exc:
-            raise ContainerFileSystemError(f"Failed to read file: {exc.strerror}") from exc
-        with os.fdopen(fd, "rb") as fh:
-            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-                raise ContainerFileSystemError("Not a regular file")
-            data = fh.read(MAX_READ_BYTES + 1)
-        if len(data) > MAX_READ_BYTES:
-            raise ContainerFileSystemError(
-                f"File is larger than {MAX_READ_BYTES // MB} MB; "
-                "use bash_tool (head, grep, sed -n) to inspect it"
-            )
-        return data
-
-    def _list_host_dir(self, container_path: str) -> str:
-        host = self._host_path(container_path)
-        try:
-            with os.scandir(host) as it:
-                entries = sorted(it, key=lambda e: e.name)
-        except OSError as exc:
-            raise ContainerFileSystemError(f"Failed to list directory: {exc.strerror}") from exc
-        lines = []
-        for entry in entries:
-            try:
-                st = entry.stat(follow_symlinks=False)
-                name = entry.name + ("/" if stat.S_ISDIR(st.st_mode) else "")
-                if stat.S_ISLNK(st.st_mode):
-                    name += f" -> {os.readlink(entry.path)}"
-            except OSError:
-                continue  # 列目录期间被删掉
-            mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
-            lines.append(f"{stat.filemode(st.st_mode)} {st.st_size:>10} {mtime} {name}")
-        return "\n".join(lines) or "(empty directory)"
+    async def copy_to_host(self, container_path: str, host_dest: Path) -> None:
+        """经 sandbox-manager 读出容器内文件写到 host_dest;宿主侧读不到源文件时的兜底。"""
+        await self.manager_client.copy_from_container(
+            self.container_name, container_path, host_dest
+        )
 
     def validate_writable_path(self, container_path: str) -> None:
         relative = self._container_path_to_relative(container_path)
@@ -401,121 +368,60 @@ class BashSession:
                 f"Path '{container_path}' is not in a writable directory"
             )
         data = content.encode("utf-8")
-        await asyncio.to_thread(self._write_host_file, host_path, data, mkdir_parents)
+        await asyncio.to_thread(host_files.write_file, host_path, data, mkdir_parents)
 
-    @staticmethod
-    def _write_host_file(host_path: Path, data: bytes, mkdir_parents: bool) -> None:
-        try:
-            if mkdir_parents:
-                missing = []
-                parent = host_path.parent
-                while not parent.exists():
-                    missing.append(parent)
-                    parent = parent.parent
-                host_path.parent.mkdir(parents=True, exist_ok=True)
-                for d in missing:  # agent 用户需要能在新目录里继续写
-                    d.chmod(0o777)
-            existed = host_path.exists()
-            # O_NOFOLLOW:解析之后若末段被换成符号链接则拒绝(缩小 TOCTOU 窗口)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-            fd = os.open(host_path, flags, 0o666)
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(data)
-            if not existed:
-                host_path.chmod(0o666)
-        except OSError as exc:
-            raise ContainerFileSystemError(f"Failed to write file: {exc}") from exc
+    # ── 回退快照 ──
 
-    def _workspace_bwrap_args(self) -> list[str]:
-        """Bind physical session/skills dirs onto the stable /workspace tree."""
-        args: list[str] = ["--dir", self.paths.virtual_root]
-        readonly = {"uploads"}
+    async def snapshot(self, prompt_id: str) -> bool:
+        """给 output / scratchpad 做一份快照,供回退时恢复;成功返回 True。
 
-        for name in sorted(SESSION_SUBDIRS):
-            physical = f"{self.paths.container_root}/{name}"
-            virtual = self.paths.virtual_subdir(name)
-            bind_flag = "--ro-bind" if name in readonly else "--bind"
-            args.extend([bind_flag, physical, virtual])
-
-        args.extend(
-            [
-                "--ro-bind",
-                CONTAINER_DEFAULT_SKILLS,
-                self.paths.virtual_skills,
-            ]
+        由容器内的 agent 用户复制,scratchpad 下的转换中间目录不复制。内容与最新一份快照相同时
+        只建硬链接副本。合计超过 SNAPSHOT_MAX_MB 就跳过,只保留最近 SNAPSHOT_KEEP 份。
+        不持会话锁:每轮开始前调用,此时本会话还没有命令在跑。
+        """
+        if not settings.SNAPSHOT_KEEP:
+            return False
+        sid = self.paths.session_id
+        size, fingerprint = await asyncio.to_thread(snapshot_manifest, self.paths.session_root)
+        if size > settings.SNAPSHOT_MAX_MB * MB:
+            logger.info("Session %s too large to snapshot (%d MB)", sid, size // MB)
+            return False
+        script = snapshot_script(
+            self.paths.container_root, prompt_id, fingerprint, settings.SNAPSHOT_KEEP
         )
-        return args
+        try:
+            result = await self.manager_client.run_exec(self.container_name, script)
+        except Exception:
+            logger.exception("Snapshot of session %s failed", sid)
+            return False
+        if result.returncode != 0:
+            logger.warning("Snapshot of session %s failed: %s", sid, result.stderr.strip())
+            return False
+        return True
 
-    def _build_bwrap_argv(self) -> list[str]:
-        return [
-            *self._bwrap_base_argv(self.paths.virtual_scratchpad),
-            "bash",
-            "--noprofile",
-            "--norc",
-        ]
+    async def restore_snapshot(self, prompt_id: str) -> bool:
+        """把 output / scratchpad 恢复成该轮开始前的样子,并丢弃这一轮及之后的快照。
 
-    def _bwrap_base_argv(self, home: str) -> list[str]:
-        """bwrap 的全部隔离参数(不含要运行的程序)。"""
-        tmpfs_size = str(512 * 1024 * 1024)
-        return [
-            "bwrap",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            # 宿主镜像里 /bin、/sbin 是指向 usr 的符号链接;缺了它们,
-            # 以 #!/bin/sh 开头的脚本(如 soffice)会报 "required file not found"
-            "--symlink",
-            "usr/bin",
-            "/bin",
-            "--symlink",
-            "usr/sbin",
-            "/sbin",
-            "--ro-bind",
-            "/lib",
-            "/lib",
-            "--ro-bind",
-            "/lib64",
-            "/lib64",
-            "--ro-bind",
-            "/etc",
-            "/etc",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--size",
-            tmpfs_size,
-            "--tmpfs",
-            "/tmp",
-            *self._workspace_bwrap_args(),
-            "--chdir",
-            self.paths.virtual_scratchpad,
-            "--new-session",
-            # bwrap 作为新 PID 命名空间的 init,它一死命名空间内所有进程都会被内核杀掉,
-            # 这样取消/重置时只需杀 bwrap 就能清掉后台命令(基线 #7)
-            "--unshare-pid",
-            "--die-with-parent",
-            # Clean environment
-            "--clearenv",
-            "--setenv",
-            "HOME",
-            home,
-            "--setenv",
-            "PATH",
-            "/usr/local/bin:/usr/bin:/bin",
-            "--setenv",
-            "NODE_PATH",
-            "/usr/local/lib/node_modules",
-            "--setenv",
-            "TMPDIR",
-            "/tmp",
-            "--setenv",
-            "TERM",
-            "xterm-256color",
-            "--setenv",
-            "LANG",
-            "en_US.UTF-8",
-        ]
+        没有对应快照(过期被淘汰、当时太大、旧会话)返回 False,文件保持现状。
+        """
+        sid = self.paths.session_id
+        script = restore_script(self.paths.container_root, prompt_id)
+        async with self._lock:
+            # 命令行里的工作目录可能在被清掉的子目录里,先关掉 shell,下次执行时会重新启动
+            await self._stop()
+            try:
+                result = await self.manager_client.run_exec(self.container_name, script)
+            except Exception:
+                logger.exception("Restoring snapshot of session %s failed", sid)
+                return False
+        if result.returncode == RESTORE_MISSING:
+            return False
+        if result.returncode != 0:
+            logger.warning("Restoring session %s failed: %s", sid, result.stderr.strip())
+            return False
+        return True
+
+    # ── 命令执行 ──
 
     async def run_isolated(
         self, command: str, timeout: int | None = COMMAND_TIMEOUT_SEC
@@ -526,40 +432,35 @@ class BashSession:
         所以 LibreOffice 之类带用户配置的程序不会和 agent shell 里的实例抢同一份配置。
         不经过命令校验和配额检查:只给后端自己拼的固定命令用,不要传入模型给的命令。
         """
-        argv = [*self._bwrap_base_argv("/tmp"), "bash", "-c", command]
+        argv = bwrap.oneshot_argv(self.paths, command)
         prefix = ""
         if settings.SESSION_MAX_FILE_MB:
             prefix = f"ulimit -f {settings.SESSION_MAX_FILE_MB * 1024}; "
         # exec:让 bwrap 直接取代 sh,超时的 KILL 才会落在 bwrap 上(--die-with-parent 随之清掉子进程)
         script = f"{prefix}exec {shlex.join(argv)}"
         try:
-            result = await self.docker_client.run_exec(
-                self.container_name, script, self.exec_user, timeout=_cap_timeout(timeout)
+            result = await self.manager_client.run_exec(
+                self.container_name, script, timeout=cap_timeout(timeout)
             )
         except TimeoutError:
-            return f"Error: timed out after {_cap_timeout(timeout)} seconds", True
+            return f"Error: timed out after {cap_timeout(timeout)} seconds", True
         except Exception as exc:  # 管理器限流(429)或暂时不可用
             logger.warning("Isolated exec failed for session %s: %r", self.paths.session_id, exc)
             return f"Error: sandbox unavailable ({type(exc).__name__})", True
         output = (result.stdout + result.stderr).strip()
         return output, result.returncode != 0
 
-    async def _ensure_started(self, user: str | None = None) -> None:
-        exec_user = user or self.exec_user
-        if (
-            self._process is not None
-            and self._process.returncode is None
-            and self._active_exec_user == exec_user
-        ):
+    async def _ensure_started(self) -> None:
+        """shell 不在时经 /spawn 启动一个新的;启动后 cwd 回到 scratchpad。"""
+        if self.shell_alive:
             return
         if self._process is not None:
             await self._stop()
 
-        self._active_exec_user = exec_user
         self._current_cwd = self.paths.virtual_scratchpad
         self._output_queue = asyncio.Queue()
-        self._process = await self.docker_client.spawn(
-            self.container_name, self._build_bwrap_argv(), user=exec_user
+        self._process = await self.manager_client.spawn(
+            self.container_name, bwrap.shell_argv(self.paths)
         )
         self._start_readers()
         await asyncio.sleep(0.2)
@@ -575,7 +476,7 @@ class BashSession:
         if settings.SESSION_MAX_FILE_MB:
             # 同时设软硬上限,agent 无法再调高;超限的写入会让对应进程收到 SIGXFSZ
             script += f"ulimit -f {settings.SESSION_MAX_FILE_MB * 1024}\n"
-        await self.docker_client.write_stdin(self._process, script)
+        await self.manager_client.write_stdin(self._process, script)
         await asyncio.sleep(0.05)
         await self._drain_queue()
 
@@ -636,7 +537,7 @@ class BashSession:
 
         if self._process is not None:
             try:
-                await self.docker_client.terminate(self._process)
+                await self.manager_client.terminate(self._process)
             finally:
                 self._process = None
         await self._drain_queue()
@@ -718,7 +619,7 @@ class BashSession:
                 stderr_lines.append(stripped)
         else:
             await self._stop()
-            await self._ensure_started(self._active_exec_user)
+            await self._ensure_started()
             return "", True, None
 
         output = self._beautify_output(stdout_lines, stderr_lines)
@@ -777,7 +678,11 @@ class BashSession:
 
 
 class BashSessionsManager:
-    """Manages session folders and BashSession instances."""
+    """登记各会话的 BashSession,负责会话目录的准备与删除、空闲 shell 回收。
+
+    以 session_id 为参数的方法(bash_tool_helper、snapshot_session 等)是给工具和服务用的
+    便捷入口,内部转给对应的 BashSession。
+    """
 
     def __init__(
         self,
@@ -789,18 +694,12 @@ class BashSessionsManager:
         self._sessions: dict[str, BashSession] = {}
         self._lock = asyncio.Lock()
         self._validator = CommandValidator()
-        self._docker_client = ManagerClient()
+        self._manager_client = ManagerClient()
 
-    async def _create_locked(self, sid: str, exec_user: str = CONTAINER_AGENT_USER) -> BashSession:
+    async def _create_locked(self, sid: str) -> BashSession:
         paths = SessionPaths.create(sid, self.host_sessions_root)
         await self._provision_folders(paths)
-        session = BashSession(
-            paths,
-            self.container_name,
-            self._validator,
-            self._docker_client,
-            exec_user=exec_user,
-        )
+        session = BashSession(paths, self.container_name, self._validator, self._manager_client)
         self._sessions[sid] = session
         return session
 
@@ -859,7 +758,7 @@ class BashSessionsManager:
         await asyncio.to_thread(shutil.rmtree, paths.session_root, True)
         # 宿主侧删不干净(文件属主不一致等)时,再让 manager 以 root 清一遍
         if paths.session_root.exists():
-            await self._docker_client.remove_session(self.container_name, paths.container_root)
+            await self._manager_client.remove_session(self.container_name, paths.container_root)
 
     async def bash_tool_helper(
         self,
@@ -880,83 +779,20 @@ class BashSessionsManager:
         return await session.execute(command, timeout=timeout)
 
     async def snapshot_session(self, session_id: str, prompt_id: str) -> bool:
-        """每轮开始前给 output / scratchpad 做一份快照,供回退时恢复;成功返回 True。
-
-        快照放在会话目录的 snapshots/ 下(不在 bwrap 挂载里,agent 的命令碰不到),
-        由容器内的 agent 用户复制。scratchpad 下的转换中间目录(SNAPSHOT_EXCLUDED)不复制。
-        内容与最新一份快照相同(路径、类型、权限、大小、mtime 一致)时只建硬链接副本,
-        不再复制。合计超过 SNAPSHOT_MAX_MB 就跳过,只保留最近 SNAPSHOT_KEEP 份。
-        先写到 .tmp_ 目录再改名,复制失败不会留下残缺的快照。
-        """
+        """每轮开始前给会话做回退快照,成功返回 True。见 BashSession.snapshot。"""
         if not settings.SNAPSHOT_KEEP:
             return False
         session = await self.get_or_create(session_id)
-        paths = session.paths
-        size, fingerprint = await asyncio.to_thread(snapshot_manifest, paths.session_root)
-        if size > settings.SNAPSHOT_MAX_MB * MB:
-            logger.info("Session %s too large to snapshot (%d MB)", session_id, size // MB)
-            return False
-        root = paths.container_root
-        name = shlex.quote(snapshot_name(prompt_id))
-        tmp = shlex.quote(f".tmp_{snapshot_name(prompt_id, suffix_only=True)}")
-        excludes = " ".join(f"--exclude=scratchpad/{d}" for d in SNAPSHOT_EXCLUDED)
-        script = (
-            "set -e; set -o pipefail; export LC_ALL=C; "
-            f"mkdir -p {root}/snapshots; cd {root}/snapshots; rm -rf .tmp_*; "
-            "L=$(ls -1 | tail -n 1); "
-            f'if [ -n "$L" ] && [ "$(cat "$L"/.manifest 2>/dev/null)" = {fingerprint} ]; then '
-            f'cp -al "$L" {tmp}; '
-            f"else mkdir {tmp}; "
-            f"tar -C {root} --anchored {excludes} -cf - output scratchpad | tar -C {tmp} -xpf -; "
-            f"echo {fingerprint} > {tmp}/.manifest; fi; "
-            f"mv {tmp} {name}; "
-            f"ls -1 | head -n -{settings.SNAPSHOT_KEEP} | xargs -r rm -rf"
-        )
-        try:
-            result = await self._docker_client.run_exec(self.container_name, script)
-        except Exception:
-            logger.exception("Snapshot of session %s failed", session_id)
-            return False
-        if result.returncode != 0:
-            logger.warning("Snapshot of session %s failed: %s", session_id, result.stderr.strip())
-            return False
-        return True
+        return await session.snapshot(prompt_id)
 
     async def restore_snapshot(self, session_id: str, prompt_id: str) -> bool:
-        """把 output / scratchpad 恢复成该轮开始前的样子,并丢弃这一轮及之后的快照。
-
-        没有对应快照(过期被淘汰、当时太大、旧会话)返回 False,文件保持现状。
-        """
+        """回退到该轮开始前的文件状态。见 BashSession.restore_snapshot。"""
         session = await self.get_or_create(session_id)
-        root = session.paths.container_root
-        suffix = shlex.quote(snapshot_name(prompt_id, suffix_only=True))
-        script = (
-            "export LC_ALL=C; "
-            f"cd {root}/snapshots 2>/dev/null || exit 3; "
-            f'T=$(ls -1 | grep -F -- {suffix} | tail -n 1); [ -n "$T" ] || exit 3; '
-            "set -e; "
-            f"find {root}/output -mindepth 1 -delete; find {root}/scratchpad -mindepth 1 -delete; "
-            f'cp -a "$T"/output/. {root}/output/; cp -a "$T"/scratchpad/. {root}/scratchpad/; '
-            "ls -1 | awk -v t=\"$T\" '$0 >= t' | xargs -r rm -rf"
-        )
-        async with session._lock:
-            # 命令行里的工作目录可能在被清掉的子目录里,先关掉 shell,下次执行时会重新启动
-            await session._stop()
-            try:
-                result = await self._docker_client.run_exec(self.container_name, script)
-            except Exception:
-                logger.exception("Restoring snapshot of session %s failed", session_id)
-                return False
-        if result.returncode == 3:
-            return False
-        if result.returncode != 0:
-            logger.warning("Restoring session %s failed: %s", session_id, result.stderr.strip())
-            return False
-        return True
+        return await session.restore_snapshot(prompt_id)
 
     async def _provision_folders(self, paths: SessionPaths) -> None:
         self.host_sessions_root.mkdir(parents=True, exist_ok=True)
         paths.session_root.mkdir(parents=True, exist_ok=True)
         for subdir in paths.subdirs:
             subdir.mkdir(parents=True, exist_ok=True)
-        await self._docker_client.provision_session(self.container_name, paths.container_root)
+        await self._manager_client.provision_session(self.container_name, paths.container_root)

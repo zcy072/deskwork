@@ -18,7 +18,7 @@ def _manager(tmp_path, monkeypatch):
     monkeypatch.setattr(bash_handler, "ManagerClient", SpyClient)
     monkeypatch.setattr(session_paths, "SANDBOX_DATA_ROOT", tmp_path.parent)
     manager = BashSessionsManager(host_sessions_root=tmp_path)
-    return manager, manager._docker_client
+    return manager, manager._manager_client
 
 
 async def test_purge_skips_manager_when_host_delete_succeeds(tmp_path, monkeypatch):

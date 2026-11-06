@@ -18,7 +18,7 @@ class FakeSession:
             virtual_to_container_path=lambda v: v,
             virtual_to_host_path=lambda v: self.scratch / v.rsplit("/", 1)[-1],
         )
-        self.docker_client = None
+        self.manager_client = None
         self.container_name = "c"
 
     def resolve_virtual_path(self, raw: str) -> str:

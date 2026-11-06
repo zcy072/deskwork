@@ -31,7 +31,7 @@ class FakeClient:
         await asyncio.sleep(0.01)  # 让出事件循环,暴露创建过程中的竞态
         self.provisioned.append(path)
 
-    async def spawn(self, container, argv, user=None):
+    async def spawn(self, container, argv):
         proc = FakeProcess()
         self.spawned.append(proc)
         return proc
@@ -56,19 +56,19 @@ def manager(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "SESSION_MAX_STORAGE_MB", 0)
     monkeypatch.setattr(settings, "SESSION_MAX_FILE_MB", 0)
     mgr = BashSessionsManager(host_sessions_root=tmp_path / "sessions")
-    mgr._docker_client = FakeClient()
+    mgr._manager_client = FakeClient()
     return mgr
 
 
 async def test_concurrent_get_or_create_returns_same_session(manager):
     a, b = await asyncio.gather(manager.get_or_create("race"), manager.get_or_create("race"))
     assert a is b
-    assert len(manager._docker_client.provisioned) == 1
+    assert len(manager._manager_client.provisioned) == 1
 
 
 async def test_spoofed_sentinel_in_output_does_not_end_command(manager):
     """输出里出现固定前缀的假标记(例如 cat 了含它的文件)只是普通输出。"""
-    client = manager._docker_client
+    client = manager._manager_client
     client.reply = lambda sentinel: [
         f"{BASH_SENTINEL}:0:/workspace/output\n",
         "after\n",
@@ -92,7 +92,7 @@ async def test_each_command_gets_a_fresh_sentinel(manager):
 async def test_idle_shells_are_closed_and_restart_on_next_command(manager, monkeypatch):
     monkeypatch.setattr(settings, "SANDBOX_SHELL_IDLE_SEC", 60)
     monkeypatch.setattr(settings, "SANDBOX_MAX_SHELLS", 0)
-    client = manager._docker_client
+    client = manager._manager_client
     old = await manager.get_or_create("old")
     await old.execute("ls")
     old.last_used -= 120  # 已空闲两分钟
@@ -124,7 +124,7 @@ async def test_shell_count_is_capped_by_least_recently_used(manager, monkeypatch
 async def test_busy_shell_is_not_reaped(manager, monkeypatch):
     monkeypatch.setattr(settings, "SANDBOX_SHELL_IDLE_SEC", 60)
     monkeypatch.setattr(settings, "SANDBOX_MAX_SHELLS", 0)
-    client = manager._docker_client
+    client = manager._manager_client
     client.reply = lambda sentinel: []  # 命令一直不结束
     busy = await manager.get_or_create("busy")
     task = asyncio.create_task(busy.execute("sleep 999", timeout=30))

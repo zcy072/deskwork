@@ -1,6 +1,12 @@
-"""sandbox-manager 的客户端。
+"""sandbox-manager 的客户端:只负责通信,不含会话逻辑。
 
-后端不再接触 docker.sock:所有容器操作经 HTTP/WebSocket 交给 sandbox-manager。
+后端不接触 docker.sock,所有容器操作经 HTTP / WebSocket 交给 sandbox-manager:
+    WS   /spawn      启动常驻 bwrap shell,帧首字节区分 stdin / stdout / stderr  -> spawn()
+    POST /exec       以 agent 用户跑一次性脚本(快照、恢复、隔离命令)        -> run_exec()
+    POST /file       读会话内文件(宿主侧读不到时的兜底)                      -> copy_from_container()
+    POST /provision  以 root 修正会话目录权限                                  -> provision_session()
+    POST /remove     以 root 删除会话目录                                      -> remove_session()
+容器内的用户固定为 agent,root 操作只有 provision / remove 两个固定动作。
 """
 
 import asyncio
@@ -12,7 +18,7 @@ from pathlib import Path
 import httpx
 import websockets
 
-from app.sandbox.constants import COMMAND_TIMEOUT_SEC, CONTAINER_AGENT_USER, CONTAINER_ROOT
+from app.sandbox.constants import COMMAND_TIMEOUT_SEC, CONTAINER_AGENT_USER
 from app.sandbox.errors import TransientSandboxError
 from app.utils import logger
 
@@ -28,7 +34,8 @@ SPAWN_CLOSE_REASONS = {
 }
 
 
-def _cap_timeout(timeout: int | None) -> int:
+def cap_timeout(timeout: int | None) -> int:
+    """命令超时不超过 COMMAND_TIMEOUT_SEC;None 取上限。"""
     if timeout is None:
         return COMMAND_TIMEOUT_SEC
     return min(int(timeout), COMMAND_TIMEOUT_SEC)
@@ -125,14 +132,15 @@ class ManagerClient:
             )
         return self._http
 
-    async def spawn(
-        self, container: str, argv: list[str], user: str = CONTAINER_AGENT_USER
-    ) -> RemoteProcess:
+    async def spawn(self, container: str, argv: list[str]) -> RemoteProcess:
+        """以 agent 用户启动 argv(argv[0] 须为 bwrap)。被拒绝时连接随即关闭,原因见 close_reason。"""
         self._require_url()
         ws_url = self.base_url.replace("http", "ws", 1) + "/spawn"
         ws = await websockets.connect(ws_url, additional_headers=self._headers, max_size=None)
         try:
-            await ws.send(json.dumps({"container": container, "user": user, "argv": argv}))
+            await ws.send(
+                json.dumps({"container": container, "user": CONTAINER_AGENT_USER, "argv": argv})
+            )
         except BaseException:
             await ws.close()
             raise
@@ -145,19 +153,12 @@ class ManagerClient:
     async def remove_session(self, container: str, container_path: str) -> None:
         await self._post("/remove", {"container": container, "path": container_path})
 
-    async def run_exec(
-        self,
-        container: str,
-        script: str,
-        user: str = CONTAINER_AGENT_USER,
-        timeout: int | None = None,
-    ) -> ExecResult:
-        if user == CONTAINER_ROOT:
-            raise PermissionError("root exec is not exposed by sandbox-manager")
+    async def run_exec(self, container: str, script: str, timeout: int | None = None) -> ExecResult:
+        """以 agent 用户执行 sh 脚本。超时抛 TimeoutError,其他非 200 抛 httpx.HTTPStatusError。"""
         try:
             resp = await self.http.post(
                 "/exec",
-                json={"container": container, "script": script, "timeout": _cap_timeout(timeout)},
+                json={"container": container, "script": script, "timeout": cap_timeout(timeout)},
             )
         except httpx.TimeoutException as exc:
             raise TimeoutError from exc

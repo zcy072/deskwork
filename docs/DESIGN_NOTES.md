@@ -73,6 +73,7 @@ flowchart LR
 - Compose 的 sandbox 断网、限制 CPU/内存/PID、根文件系统只读；bwrap 提供会话挂载和 PID 隔离。上传、宿主读取和输出溢出有符号链接防护。
 - 命令串行执行，依赖 cwd 的校验在取得 BashSession 锁后进行。结束标记每次带随机 nonce；超时、取消及输出超限会结束相应 shell。shell 按空闲时间和 LRU 回收。
 - manager 给每个 bwrap 加唯一的 `DESKWORK_SPAWN_ID` 标记（在 `--clearenv` 前设置，agent 环境里看不到），结束时只杀它；按会话目录匹配会连带杀掉同会话里并行的一次性 bwrap 和刚重启的 shell。manager 拒绝启动（4401 认证、4429 并发 shell 达到 `MANAGER_MAX_SPAWN`、4400 参数）时，错误信息写明原因。
+- `/spawn` 用 `sh -c '"$@"; exit $?'` 托着 bwrap，不让 bwrap 直接当 `docker exec` 的进程：那样它的父进程在容器外，并发启动时偶尔先退出，`--die-with-parent` 会把刚起的 shell 以 137 杀掉（`make sandbox-verify` 约三成失败，老代码同样复现）。sh 不能改成 `exec`。
 - 文件工具（`view_file`、`str_replace` 等）、看图、预览和版本读取都在后端经 bind mount 读宿主文件：解析后必须仍在本会话目录（或 skills）内，再以 `O_NOFOLLOW` 打开（`read_host_file` / `open_host_file`）。沙箱的 `/exec` 不在 bwrap 内，看得到所有会话目录，不能交给它读。
 - 删除会话先在宿主侧删目录，删不干净（属主不一致等）才让 manager 以 root 清理。
 - manager 的 `/provision`（每个后端进程首次用到某会话时调用）只改顶层目录：会话根与 `uploads` 775，`output`、`scratchpad` 归 agent 且 777，`snapshots` 归 agent 且 700。不递归：后端与 agent 都是 UID 1000，目录里的文件属主本来就可读写；递归会随文件数变慢，还会给版本和快照文件加上可执行位。
@@ -93,7 +94,7 @@ flowchart LR
 - 快照和版本目录不挂进 Agent 的 `/workspace`；删除会话时随数据清理。版本历史和任务回退快照是不同用途。
 - 会话备份包（`/files/export`）含消息、uploads/output 文件、sha256 清单和 checkpoint 原始行，不含版本历史与快照；生成中拒绝导出。已压缩的格式（docx/xlsx/pptx、图片、zip 等）不再二次压缩，直接存入。导入（`/conversations/import`）总是建新会话，备份包按不可信数据处理：路径逐段校验、解压限字节、校验 sha256，checkpoint 先过 LangGraph 的安全类型白名单再写库（读 checkpoint 会按模块名 import 并调用，不校验等于任意代码执行），失败整体回滚。实现见 [session_export.py](../backend/app/services/session_export.py)、[session_import.py](../backend/app/services/session_import.py)、[checkpoint_transfer.py](../backend/app/services/checkpoint_transfer.py)。
 
-入口：[chat_operations.py](../backend/app/services/chat_operations.py)、[bash_handler.py](../backend/app/sandbox/bash_handler.py)、[file_versions.py](../backend/app/services/file_versions.py)。
+入口：[chat_operations.py](../backend/app/services/chat_operations.py)、[bash_handler.py](../backend/app/sandbox/bash_handler.py)、[snapshots.py](../backend/app/sandbox/snapshots.py)、[file_versions.py](../backend/app/services/file_versions.py)。
 
 ## 5. 文档检索与原文引用
 

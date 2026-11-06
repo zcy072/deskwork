@@ -78,7 +78,7 @@ class FakeClient:
         self.proc = None
         self.scripts = []
 
-    async def spawn(self, container, argv, user=None):
+    async def spawn(self, container, argv):
         self.proc = FakeProcess()
         return self.proc
 
@@ -101,7 +101,7 @@ def session(tmp_path, monkeypatch):
     paths = SessionPaths.create("quota-test", sessions_root=tmp_path)
     paths.scratchpad.mkdir(parents=True)
     client = FakeClient()
-    return BashSession(paths, docker_client=client), paths, client
+    return BashSession(paths, manager_client=client), paths, client
 
 
 async def test_over_quota_blocks_normal_commands_but_allows_cleanup(session, monkeypatch):

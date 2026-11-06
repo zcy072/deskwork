@@ -111,7 +111,7 @@ def session(tmp_path, monkeypatch):
             virtual_to_host_path=lambda v: src,
         ),
         resolve_virtual_path=lambda raw: "/workspace/scratchpad/a.docx",
-        docker_client=None,
+        manager_client=None,
         container_name="c",
         is_file=is_file,
     )

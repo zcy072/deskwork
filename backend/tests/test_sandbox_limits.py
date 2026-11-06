@@ -30,7 +30,7 @@ class FloodClient:
         self.spawned = 0
         self._tasks: list[asyncio.Task] = []
 
-    async def spawn(self, container, argv, user=None):
+    async def spawn(self, container, argv):
         self.spawned += 1
         return FakeProcess()
 
@@ -59,7 +59,7 @@ async def test_output_flood_is_cut_off(tmp_path, monkeypatch):
     paths = SessionPaths.create("flood", sessions_root=tmp_path)
     paths.scratchpad.mkdir(parents=True)
     client = FloodClient()
-    session = BashSession(paths, docker_client=client)
+    session = BashSession(paths, manager_client=client)
     out, is_error = await asyncio.wait_for(session.execute("yes", timeout=30), timeout=20)
     assert is_error
     assert "Output limit exceeded" in out
@@ -115,7 +115,7 @@ async def test_remote_process_reports_manager_rejection():
 
 async def test_session_start_error_names_manager_rejection(tmp_path):
     class RejectingClient:
-        async def spawn(self, container, argv, user=None):
+        async def spawn(self, container, argv):
             ws = FakeWS([])
             ws.close_code = 4429
             proc = RemoteProcess(ws)
@@ -125,7 +125,7 @@ async def test_session_start_error_names_manager_rejection(tmp_path):
     paths = SessionPaths.create("rejected", sessions_root=tmp_path)
     for d in paths.subdirs:
         d.mkdir(parents=True)
-    session = BashSession(paths, docker_client=RejectingClient())
+    session = BashSession(paths, manager_client=RejectingClient())
     with pytest.raises(RuntimeError, match="concurrent shell limit"):
         await session._ensure_started()
 
@@ -134,7 +134,7 @@ async def test_large_file_write_via_host_mount(tmp_path):
     paths = SessionPaths.create("bigwrite", sessions_root=tmp_path)
     for d in paths.subdirs:
         d.mkdir(parents=True)
-    session = BashSession(paths, docker_client=object())
+    session = BashSession(paths, manager_client=object())
     content = "é" * 250_000  # 500KB utf-8
     target = f"{paths.container_root}/output/sub/dir/big.txt"
     await session._write_container_content(target, content, mkdir_parents=True)
@@ -152,7 +152,7 @@ async def test_write_refuses_symlink_escape(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (paths.output / "link").symlink_to(outside)
-    session = BashSession(paths, docker_client=object())
+    session = BashSession(paths, manager_client=object())
     with pytest.raises(ContainerFileSystemError):
         await session._write_container_content(f"{paths.container_root}/output/link/x.txt", "x")
     assert not (outside / "x.txt").exists()

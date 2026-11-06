@@ -308,7 +308,10 @@ def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
             ws.send_bytes(b"\x00echo hi\n")  # stdin 已断:应当照常清理而不是抛异常
             assert json.loads(ws.receive_text()) == {"exit": -15}
     spawned, killer = calls[0], calls[1]
-    bwrap = spawned[spawned.index("bwrap") :]
+    # bwrap 由一层 sh 托着(不直接当 docker exec 的进程,见 manager 注释)
+    i = spawned.index("bwrap")
+    assert spawned[i - 4 : i] == ("sh", "-c", '"$@"; exit $?', "sh")
+    bwrap = spawned[i:]
     assert bwrap[1:3] == ("--setenv", "DESKWORK_SPAWN_ID")
     assert bwrap[4:] == tuple(spec["argv"][1:])
     assert killer[-1] == f"^bwrap --setenv DESKWORK_SPAWN_ID {bwrap[3]} "

@@ -8,7 +8,7 @@ from app.sandbox.session_paths import SessionPaths
 def _session(tmp_path) -> BashSession:
     paths = SessionPaths.create("spill-test", sessions_root=tmp_path)
     paths.scratchpad.mkdir(parents=True)
-    return BashSession(paths, docker_client=object())
+    return BashSession(paths, manager_client=object())
 
 
 def test_short_output_untouched(tmp_path):

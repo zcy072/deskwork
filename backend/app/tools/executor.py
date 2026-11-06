@@ -254,11 +254,7 @@ async def _present_container_files(
         except ValueError:
             host_src = None
         if host_src is None or not await asyncio.to_thread(_copy_local, host_src, host_dest):
-            await session.docker_client.copy_from_container(
-                session.container_name,
-                container_path,
-                host_dest,
-            )
+            await session.copy_to_host(container_path, host_dest)
         await asyncio.to_thread(finish_archive, session.paths, host_dest, archived)
         # 文件已复制到 output/;记录必须指向这份副本,下载接口只放行 uploads/ 和 output/
         record = {

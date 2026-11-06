@@ -85,7 +85,7 @@ class FakeClient:
         self.spawned: list[FakeProcess] = []
         self.terminated: list[FakeProcess] = []
 
-    async def spawn(self, container, argv, user=None):
+    async def spawn(self, container, argv):
         proc = FakeProcess()
         self.spawned.append(proc)
         return proc
@@ -113,7 +113,7 @@ def _data_root(tmp_path, monkeypatch):
 def _session(tmp_path, client) -> BashSession:
     paths = SessionPaths.create("cancel-test", sessions_root=tmp_path)
     paths.scratchpad.mkdir(parents=True)
-    return BashSession(paths, docker_client=client)
+    return BashSession(paths, manager_client=client)
 
 
 async def test_normal_command_returns_output(tmp_path):

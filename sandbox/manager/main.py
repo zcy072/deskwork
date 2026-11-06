@@ -305,8 +305,12 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
     spawn_id = secrets.token_hex(8)
     argv = ["bwrap", "--setenv", "DESKWORK_SPAWN_ID", spawn_id, *argv[1:]]
 
+    # bwrap 不能直接当 docker exec 的进程:它的父进程在容器外,并发启动时偶尔先退出,
+    # --die-with-parent 随即 SIGKILL 掉刚起的 shell(退出码 137)。垫一层 sh 当父进程,
+    # 不用 exec,保证 sh 一直活到 bwrap 结束。
     proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", "-i", "-u", AGENT_USER, CONTAINER, *argv,
+        "docker", "exec", "-i", "-u", AGENT_USER, CONTAINER,
+        "sh", "-c", '"$@"; exit $?', "sh", *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

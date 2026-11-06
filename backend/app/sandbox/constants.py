@@ -4,7 +4,6 @@ from pathlib import Path
 # Docker sandbox
 CONTAINER_NAME = "sandbox"
 CONTAINER_AGENT_USER = "agent"  # agent bash execution (restricted)
-CONTAINER_ROOT = "root"
 
 # Host layout: sandbox_data/{sessions/<id>, default_skills}
 # 本地开发时位于仓库根目录(backend/ 的上一级);容器内通过 SANDBOX_DATA_DIR 指定挂载点。

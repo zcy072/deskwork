@@ -79,11 +79,11 @@ async def main():
         await mgr.close_all()
         for sid in ids:
             await mgr.purge_session(sid)
-        remaining = await mgr._docker_client.run_exec(mgr.container_name, "ps -eo stat,args")
+        remaining = await mgr._manager_client.run_exec(mgr.container_name, "ps -eo stat,args")
         assert remaining.returncode == 0
         assert not any(prefix in line and "bwrap" in line for line in remaining.stdout.splitlines())
         results["test_processes_remaining"] = 0
-        await mgr._docker_client.http.aclose()
+        await mgr._manager_client.http.aclose()
     print("STABILITY_RESULT", json.dumps(results), flush=True)
 
 
