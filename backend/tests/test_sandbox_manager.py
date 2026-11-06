@@ -310,7 +310,19 @@ def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
     spawned, killer = calls[0], calls[1]
     # bwrap 由一层 sh 托着(不直接当 docker exec 的进程,见 manager 注释)
     i = spawned.index("bwrap")
-    assert spawned[i - 4 : i] == ("sh", "-c", '"$@"; exit $?', "sh")
+    assert spawned[:i] == (
+        "docker",
+        "exec",
+        "-i",
+        "-u",
+        manager.AGENT_USER,
+        manager.CONTAINER,
+        "sh",
+        "-c",
+        manager.SPAWN_WRAPPER,
+        "sh",
+    )
+    assert "exec" not in manager.SPAWN_WRAPPER
     bwrap = spawned[i:]
     assert bwrap[1:3] == ("--setenv", "DESKWORK_SPAWN_ID")
     assert bwrap[4:] == tuple(spec["argv"][1:])

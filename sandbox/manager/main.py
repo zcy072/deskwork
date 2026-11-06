@@ -50,6 +50,11 @@ MAX_CONCURRENT_EXEC = int(os.environ.get("MANAGER_MAX_EXEC", "16"))
 MAX_CONCURRENT_SPAWN = int(os.environ.get("MANAGER_MAX_SPAWN", "32"))
 SPAWN_HANDSHAKE_TIMEOUT = 10.0
 
+# /spawn 用 sh 托着 bwrap,参数经 "$@" 原样转交。sh 自己不能 exec 成 bwrap
+# (那样 --die-with-parent 的父进程又跑到容器外了),末尾的 exit $? 也防止
+# 某些 sh 把最后一条命令 exec 掉。
+SPAWN_WRAPPER = '"$@"; exit $?'
+
 # 通道前缀:二进制帧首字节标识流
 CH_STDIN, CH_STDOUT, CH_STDERR = 0, 1, 2
 
@@ -310,7 +315,7 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
     # 不用 exec,保证 sh 一直活到 bwrap 结束。
     proc = await asyncio.create_subprocess_exec(
         "docker", "exec", "-i", "-u", AGENT_USER, CONTAINER,
-        "sh", "-c", '"$@"; exit $?', "sh", *argv,
+        "sh", "-c", SPAWN_WRAPPER, "sh", *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
