@@ -252,7 +252,9 @@ for i, image in enumerate(images):
 print(text)
 ```
 
-OCR output is approximate. Check digits, amounts, dates and names against the page image before quoting them, and tell the user the text came from OCR.
+OCR output is approximate (in testing it misread characters in titles and company names while the digits were right). Check digits, amounts, dates and names against the page image before quoting them, and tell the user the text came from OCR.
+
+`view_image` can only open files under `/workspace/uploads` or `/workspace/output`, not `scratchpad`. To check a page, save the image straight to `/workspace/output/ocr_check_page1.png` and view it there. Do not `rm` it afterwards: deleting files asks the user for confirmation. Mention the file in your reply instead.
 
 ### Add Watermark
 ```python
