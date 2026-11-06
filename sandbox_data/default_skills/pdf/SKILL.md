@@ -231,23 +231,28 @@ pdftk input.pdf rotate 1east output rotated.pdf
 ## Common Tasks
 
 ### Extract Text from Scanned PDFs
+
+First check whether the PDF is really scanned: if `pdfplumber`/`pypdf` returns little or no text for a page, that page is an image and needs OCR. Do not OCR pages that already have a text layer.
+
+The sandbox has no network; pytesseract and pdf2image are preinstalled, and the OCR languages are `chi_sim` (Simplified Chinese) and `eng`. Always pass `lang="chi_sim+eng"`, otherwise Chinese comes out as garbage or empty.
+
 ```python
-# Requires: pip install pytesseract pdf2image
 import pytesseract
 from pdf2image import convert_from_path
 
-# Convert PDF to images
-images = convert_from_path('scanned.pdf')
+# 200 dpi is enough for body text; raise to 300 for small print (slower)
+images = convert_from_path('scanned.pdf', dpi=200)
 
-# OCR each page
 text = ""
 for i, image in enumerate(images):
     text += f"Page {i+1}:\n"
-    text += pytesseract.image_to_string(image)
+    text += pytesseract.image_to_string(image, lang="chi_sim+eng")
     text += "\n\n"
 
 print(text)
 ```
+
+OCR output is approximate. Check digits, amounts, dates and names against the page image before quoting them, and tell the user the text came from OCR.
 
 ### Add Watermark
 ```python

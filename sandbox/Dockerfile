@@ -67,6 +67,11 @@ RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
     # skills 引用的提取/OCR 工具
     "markitdown[pptx,docx,xlsx,pdf]==0.1.9" pytesseract==0.3.13 pdf2image==1.17.0
 
+# 中文 OCR 语言包。单独成层放在最后:改动它不会让上面的 npm/pip 层缓存失效。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr-chi-sim \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid ${UID} ${USER} \
     && useradd --create-home --uid ${UID} --gid ${UID} --shell /bin/bash ${USER}
 

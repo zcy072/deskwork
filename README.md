@@ -211,6 +211,8 @@ docker compose up --build
 内置技能:
 
 - `pdf`、`docx`、`pptx`、`xlsx`:对应格式的读取、编辑和生成。
+- `data-analysis`:表格数据的编码识别(含 GBK)、分析流程、结果校验和带中文的图表。Deskwork 自写。
+- `format-conversion`:`.doc/.xls/.ppt`、Markdown、PDF 之间的转换路线和保真度说明。Deskwork 自写。
 - `theme-factory`:10 套配色与字体主题,用于幻灯片、文档和 HTML(来自 [anthropics/skills](https://github.com/anthropics/skills),Apache 2.0)。
 - `doc-coauthoring`:协作撰写规格、方案和决策文档的多轮流程(来自 anthropics/skills)。
 
