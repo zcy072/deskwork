@@ -72,6 +72,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-chi-sim \
     && rm -rf /var/lib/apt/lists/*
 
+# Windows 中文字体 -> Noto CJK 的别名,让预览图接近用户机器上的效果(见文件内注释)
+COPY fonts-local.conf /etc/fonts/local.conf
+
 RUN groupadd --gid ${UID} ${USER} \
     && useradd --create-home --uid ${UID} --gid ${UID} --shell /bin/bash ${USER}
 

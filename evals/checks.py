@@ -268,6 +268,61 @@ def check_memory_forbid(res: RunResult, arg) -> tuple[bool, str]:
     return not bad, f"记忆中出现 {bad}" if bad else "ok"
 
 
+def _pptx_parts(res: RunResult, pattern: str, prefix: str) -> list[tuple[str, int]]:
+    """匹配到的每个 pptx 里,以 prefix 开头的 .xml 部件数量。"""
+    out = []
+    for n in _match_files(res, pattern):
+        data = res.files[n]
+        if not zipfile.is_zipfile(io.BytesIO(data)):
+            out.append((n, 0))
+            continue
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            out.append((n, sum(1 for p in z.namelist() if p.startswith(prefix) and p.endswith(".xml"))))
+    return out
+
+
+def check_pptx_slides(res: RunResult, arg: dict) -> tuple[bool, str]:
+    """arg: {glob, min, max}:至少一个匹配的 pptx 页数落在 [min, max]。"""
+    counts = _pptx_parts(res, arg["glob"], "ppt/slides/slide")
+    if not counts:
+        return False, f"无匹配文件 {arg['glob']}"
+    lo, hi = arg.get("min", 0), arg.get("max", 10**6)
+    ok = any(lo <= c <= hi for _, c in counts)
+    return ok, f"页数 {counts},要求 {lo}~{hi}"
+
+
+def check_pptx_has_chart(res: RunResult, arg: dict) -> tuple[bool, str]:
+    """arg: {glob, min}:pptx 里至少有 min(默认 1)个原生图表部件(不是贴图)。"""
+    counts = _pptx_parts(res, arg["glob"], "ppt/charts/chart")
+    if not counts:
+        return False, f"无匹配文件 {arg['glob']}"
+    need = arg.get("min", 1)
+    return any(c >= need for _, c in counts), f"图表数 {counts},至少 {need}"
+
+
+def check_zip_part_contains(res: RunResult, arg: dict) -> tuple[bool, str]:
+    """arg: {glob, prefix, any}:匹配文件里路径以 prefix 开头的 xml 部件,原始内容含 any 之一。
+
+    file_contains 会去掉所有标签(属性值如颜色、字体名随之丢失),查母版/版式要用这个。
+    """
+    names = _match_files(res, arg["glob"])
+    if not names:
+        return False, f"无匹配文件 {arg['glob']}"
+    for n in names:
+        if not zipfile.is_zipfile(io.BytesIO(res.files[n])):
+            continue
+        with zipfile.ZipFile(io.BytesIO(res.files[n])) as z:
+            raw = "\n".join(
+                z.read(p).decode("utf-8", "ignore")
+                for p in z.namelist()
+                if p.startswith(arg["prefix"]) and p.endswith(".xml")
+            )
+        hit = [s for s in arg["any"] if s in raw]
+        if hit:
+            return True, f"{n} 的 {arg['prefix']}* 命中 {hit}"
+    return False, f"{arg['prefix']}* 未命中 {arg['any']}"
+
+
 CHECKS = {
     "memory_count": check_memory_count,
     "memory_contains": check_memory_contains,
@@ -290,6 +345,9 @@ CHECKS = {
     "asked": check_asked,
     "max_asks": check_max_asks,
     "command_not_contains": check_command_not_contains,
+    "pptx_slides": check_pptx_slides,
+    "pptx_has_chart": check_pptx_has_chart,
+    "zip_part_contains": check_zip_part_contains,
 }
 
 

@@ -4,6 +4,19 @@ description: "Use this skill any time a .pptx file is involved in any way — as
 license: Proprietary. LICENSE.txt has complete terms
 ---
 
+> Modified for Deskwork: added "Deskwork Notes" below; the rest is the upstream text.
+
+## Deskwork Notes
+
+These override the sections below where they differ.
+
+- **Chinese fonts:** set the font explicitly on every text run, e.g. `fontFace: "Microsoft YaHei"` for sans text (users open the file on Windows). The sandbox has no YaHei, but it maps `Microsoft YaHei` / `SimHei` to Noto Sans CJK SC and `SimSun` to Noto Serif CJK SC, so your preview images are close to what the user will see. Don't pick a Latin-only font for Chinese text, and don't treat small spacing differences in the preview as bugs.
+- **Long decks, confirm the outline first:** if the deck is 8 slides or more, or its content depends on facts only the user has, write the outline in your reply (one line per slide: title and the point it makes) and ask the user to confirm before building. Use `ask_user_input` (single_select, e.g. "按这个大纲做(推荐)" / "我要调整") for the go-ahead. For short decks built from a clear request or an uploaded file, skip this and build directly.
+- **User-supplied template:** if the user uploaded a .pptx and asks to use it, follow `editing.md`. Keep the template's master, colors and fonts; do not rebuild the look with pptxgenjs. After packing, run the placeholder check in "Content QA" and make sure none of the template's sample text is left.
+- **Images:** the sandbox has no network and no stock images. Use shapes, icons (`react-icons` rendered with `sharp`), and native charts. If the user uploaded images, use those. Don't leave empty picture boxes.
+- **Charts:** prefer native pptxgenjs charts over pasted pictures, so the user can edit the numbers in PowerPoint. Take the numbers from the data file with code, never by eye.
+- **Delivery and QA images:** save the deck to `/workspace/output` and hand it over with `present_files`. `view_image` can only open files under `/workspace/uploads` or `/workspace/output`, so render the QA images into `/workspace/output/qa/` (e.g. `pdftoppm -jpeg -r 80 deck.pdf /workspace/output/qa/slide`) and view them there. Don't `rm` them afterwards, deleting files asks the user for confirmation; just don't `present_files` them.
+
 # PPTX Skill
 
 ## Quick Reference

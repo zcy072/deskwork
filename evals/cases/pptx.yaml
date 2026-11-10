@@ -1,0 +1,23 @@
+- id: pptx-sales-chart
+  category: PPT
+  files: [sales.csv]
+  prompt: 根据 sales.csv 做一份 5~6 页的销售汇报 PPT,保存为 sales_report.pptx,要有关键数字和图表,给管理层看。
+  checks:
+    - no_error: true
+    - file_exists: "*.pptx"
+    - pptx_slides: {glob: "*.pptx", min: 5, max: 7}
+    - pptx_has_chart: {glob: "*.pptx", min: 1}
+    - file_contains: {glob: "*.pptx", any: ["141,722", "141722", "14.2 万", "14.2万"]}
+  rubric: 数字与 sales.csv 一致(总销售额约 141721.8),图表是真实数据而不是示意,标题能说出结论而不只是"月度趋势"这类标签。
+- id: pptx-use-template
+  category: PPT
+  files: [brand_template.pptx]
+  prompt: 用 brand_template.pptx 作为模板,做一份 3 页的《2026 年度计划》PPT,保存为 plan.pptx,要保留模板的品牌样式。
+  checks:
+    - no_error: true
+    - file_exists: "plan.pptx"
+    - pptx_slides: {glob: "plan.pptx", min: 3, max: 4}
+    - file_contains: {glob: "plan.pptx", any: ["2026"]}
+    - zip_part_contains: {glob: "plan.pptx", prefix: "ppt/slideMasters/", any: ["C0392B"]}
+    - file_forbid_regex: {glob: "plan.pptx", patterns: ["示例要点", "模板封面", "模板内容页"]}
+  rubric: 成品沿用模板母版的品牌色竖条,而不是另起一套样式;不残留模板里的"示例要点""模板封面""模板内容页"等占位文字。
