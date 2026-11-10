@@ -1,10 +1,12 @@
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import ToolMessage
 from langgraph.config import get_stream_writer
+from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agents.context import session_id_of
+from app.services.budget import BudgetExceeded
 from app.services.doc_search import (
     Bm25Index,
     format_results,
@@ -12,7 +14,7 @@ from app.services.doc_search import (
     search_index,
     source_references,
 )
-from app.utils import logger
+from app.services.tool_feedback import error_feedback
 
 SEARCH_DOCUMENT_DESCRIPTION = """Search a long document by keywords and return the most relevant passages.
 
@@ -52,9 +54,10 @@ async def search_document(
         if sources:
             get_stream_writer()({"kind": "sources.presented", "sources": sources})
         status = "success"
+    except (BudgetExceeded, GraphBubbleUp):
+        raise
     except Exception as exc:
-        logger.error(f"search_document failed: {exc}")
-        feedback, status = f"Error: {exc}", "error"
+        feedback, status = error_feedback("search_document", exc), "error"
     return Command(
         update={
             "messages": [ToolMessage(feedback, tool_call_id=runtime.tool_call_id, status=status)]

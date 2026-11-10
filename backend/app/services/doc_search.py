@@ -21,6 +21,7 @@ from app.config import settings
 from app.sandbox import CONTAINER_MANAGER
 from app.services.document_sources import source_fingerprint
 from app.services.embeddings import cosine_with_norms, embed_texts, embedding_enabled
+from app.services.tool_feedback import ToolFeedbackError
 from app.utils import logger
 
 CHUNK_CHARS = 500
@@ -251,12 +252,12 @@ async def _load_text(session_id: str, virtual_path: str) -> tuple[str | list[str
     virtual_path = session.resolve_virtual_path(virtual_path)
     container_path = session.paths.virtual_to_container_path(virtual_path)
     if not await session.is_file(container_path):
-        raise RuntimeError(f"File not found: {virtual_path}")
+        raise ToolFeedbackError(f"File not found: {virtual_path}")
     suffix = Path(virtual_path).suffix.lower()
     if suffix in TEXT_SUFFIXES:
         return await session.read_container_file(container_path), Path(container_path)
     if suffix not in CONVERT_SUFFIXES:
-        raise RuntimeError(f"不支持检索 {suffix or '无扩展名'} 文件")
+        raise ToolFeedbackError(f"不支持检索 {suffix or '无扩展名'} 文件")
     work = f"{session.paths.virtual_root}/scratchpad/_rag"
     # 每次调用一个文件名:并行转换(含同一文件的不同版本)不会覆盖或删掉对方的中间文件
     tag = uuid.uuid4().hex
@@ -284,24 +285,24 @@ async def _load_text(session_id: str, virtual_path: str) -> tuple[str | list[str
             timeout=90,  # 沙箱执行上限(EXEC_TIMEOUT_SEC)
         )
         if is_error:
-            raise RuntimeError(f"文档转换失败: {out_text[:300]}")
+            raise ToolFeedbackError(f"文档转换失败: {out_text[:300]}")
         try:
             data = await asyncio.to_thread(
                 session.paths.read_host_file, host_out, MAX_FILE_CHARS * 4 + 1
             )
         except (OSError, ValueError) as exc:
-            raise RuntimeError(f"读取转换结果失败: {exc}") from exc
+            raise ToolFeedbackError("读取转换结果失败") from exc
     finally:
         # 索引已缓存在内存里;中间文件留着只会占配额、进快照
         with contextlib.suppress(OSError):
             await asyncio.to_thread(host_out.unlink, missing_ok=True)
     if len(data) > MAX_FILE_CHARS * 4:
-        raise RuntimeError("文档转换结果过大")
+        raise ToolFeedbackError("文档转换结果过大")
     text = data.decode("utf-8", errors="replace")
     if paged or paragraphs:
         units = json.loads(text)
         if not isinstance(units, list) or not all(isinstance(p, str) for p in units):
-            raise RuntimeError("文档分页文本转换结果无效")
+            raise ToolFeedbackError("文档分页文本转换结果无效")
         if paragraphs:
             # 每段一行,split_chunks 给出的行号就是段号
             return "\n".join(" ".join(u.split()) for u in units), host_out
@@ -330,7 +331,7 @@ async def _build_index(session_id: str, virtual_path: str) -> Bm25Index:
     text, _ = await _load_text(session_id, virtual_path)
     length = sum(map(len, text)) if isinstance(text, list) else len(text)
     if length > MAX_FILE_CHARS:
-        raise RuntimeError(f"文档过大({length} 字符,上限 {MAX_FILE_CHARS})")
+        raise ToolFeedbackError(f"文档过大({length} 字符,上限 {MAX_FILE_CHARS})")
     index = await asyncio.to_thread(
         lambda: Bm25Index(
             split_paged_chunks(text) if isinstance(text, list) else split_chunks(text)
@@ -338,7 +339,7 @@ async def _build_index(session_id: str, virtual_path: str) -> Bm25Index:
     )
     if citable:
         if fingerprint != await asyncio.to_thread(source_fingerprint, session.paths, relative):
-            raise RuntimeError("检索期间文件发生变化,请重新检索")
+            raise ToolFeedbackError("检索期间文件发生变化,请重新检索")
         index.source_path, index.fingerprint = virtual_path, fingerprint
         suffix = Path(virtual_path).suffix.lower()
         if suffix == ".pptx":

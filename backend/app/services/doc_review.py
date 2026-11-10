@@ -17,6 +17,7 @@ from app.agents.llms import get_named_model
 from app.config import settings
 from app.sandbox import CONTAINER_MANAGER
 from app.services.image_view import message_text
+from app.services.tool_feedback import ToolFeedbackError
 from app.utils import logger
 
 OFFICE_SUFFIXES = {".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".odt", ".odp", ".ods"}
@@ -47,14 +48,14 @@ def review_enabled() -> bool:
 
 
 async def render_pages(session_id: str, virtual_path: str) -> list[bytes]:
-    """返回渲染出的页面图片(JPEG 字节,按页序)。出错抛 RuntimeError,信息直接给模型看。"""
+    """返回渲染出的页面图片(JPEG 字节,按页序)。出错抛 ToolFeedbackError,信息直接给模型看。"""
     session = await CONTAINER_MANAGER.get_or_create(session_id)
     virtual_path = session.resolve_virtual_path(virtual_path)
     suffix = Path(virtual_path).suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
-        raise RuntimeError(f"不支持审阅 {suffix or '无扩展名'} 文件,仅支持 docx/pptx/xlsx/pdf")
+        raise ToolFeedbackError(f"不支持审阅 {suffix or '无扩展名'} 文件,仅支持 docx/pptx/xlsx/pdf")
     if not await session.is_file(session.paths.virtual_to_container_path(virtual_path)):
-        raise RuntimeError(f"File not found: {virtual_path}")
+        raise ToolFeedbackError(f"File not found: {virtual_path}")
 
     # 每次调用一个独立目录:并行审阅时互不清掉、读错对方的页面;读完即删,不占配额也不进快照
     run_id = uuid.uuid4().hex
@@ -75,17 +76,17 @@ async def render_pages(session_id: str, virtual_path: str) -> list[bytes]:
     try:
         out, is_error = await session.execute(" && ".join(steps), timeout=RENDER_TIMEOUT_SEC)
         if is_error:
-            raise RuntimeError(f"渲染失败: {out[:500]}")
+            raise ToolFeedbackError(f"渲染失败: {out[:500]}")
         pages = await asyncio.to_thread(lambda: sorted(host_dir.glob("page-*.jpg")))
         if not pages:
-            raise RuntimeError("渲染失败:没有生成任何页面图片(文件可能已损坏)")
+            raise ToolFeedbackError("渲染失败:没有生成任何页面图片(文件可能已损坏)")
         try:
             # 图片在 agent 可写的 scratchpad 里,读取时不能跟随它换上的符号链接
             return await asyncio.to_thread(
                 lambda: [session.paths.read_host_file(p, MAX_PAGE_BYTES) for p in pages]
             )
         except (OSError, ValueError) as exc:
-            raise RuntimeError(f"读取页面图片失败: {exc}") from exc
+            raise ToolFeedbackError("读取页面图片失败") from exc
     finally:
         await asyncio.to_thread(shutil.rmtree, host_dir, True)
 

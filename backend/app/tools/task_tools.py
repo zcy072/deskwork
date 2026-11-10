@@ -13,6 +13,7 @@ from app.agents.context import RunContext
 from app.agents.middlewares import ToolGuardMiddleware
 from app.agents.prompts import TASK_DESCRIPTION_PREFIX
 from app.config import settings
+from app.sandbox.errors import SandboxStopUnconfirmed
 from app.services.budget import BudgetExceeded
 from app.services.image_view import message_text
 from app.utils import get_trace_id, logger
@@ -94,7 +95,7 @@ def create_task_tool(tools, subagents: list[SubAgent], model, state_schema):
             )
         except BudgetExceeded:
             raise
-        except GraphBubbleUp:
+        except (GraphBubbleUp, SandboxStopUnconfirmed):
             raise
         except Exception:
             logger.exception("Sub-agent %s failed", subagent_type)

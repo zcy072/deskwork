@@ -62,3 +62,55 @@ async def test_large_file_is_refused(sessions, monkeypatch):
     (a.paths.scratchpad / "big.txt").write_text("x" * 11)
     with pytest.raises(ContainerFileSystemError, match="larger than"):
         await a.read_container_file(_cp(a, "/workspace/scratchpad/big.txt"))
+
+
+@pytest.mark.parametrize("swap_before", ["a", "b", "data.txt"])
+async def test_ancestor_swapped_during_walk_cannot_escape(sessions, monkeypatch, swap_before):
+    """R10:解析之后、逐段打开之间把任意一级目录换成指向会话外的链接,也读不到外面。"""
+    root, a = sessions
+    inside = a.paths.scratchpad / "a"
+    (inside / "b").mkdir(parents=True)
+    (inside / "b" / "data.txt").write_text("inside")
+    outside = root / "outside"
+    (outside / "b").mkdir(parents=True)
+    (outside / "b" / "data.txt").write_text("OUTSIDE_SESSION_SENTINEL")
+    opened = host_files.os.open
+    swapped = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if not swapped and str(path) == swap_before:
+            swapped.append(True)
+            inside.rename(a.paths.scratchpad / "old-a")
+            inside.symlink_to(outside, target_is_directory=True)
+        return opened(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(host_files.os, "open", swap_then_open)
+    try:
+        result = await a.read_container_file(_cp(a, "/workspace/scratchpad/a/b/data.txt"))
+    except ContainerFileSystemError:
+        result = ""
+    assert swapped
+    assert "OUTSIDE_SESSION_SENTINEL" not in result
+
+
+async def test_listing_swapped_ancestor_cannot_escape(sessions, monkeypatch):
+    root, a = sessions
+    inside = a.paths.scratchpad / "a"
+    (inside / "b").mkdir(parents=True)
+    outside = root / "outside"
+    (outside / "b").mkdir(parents=True)
+    (outside / "b" / "OUTSIDE_ENTRY").write_text("x")
+    opened = host_files.os.open
+    swapped = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if not swapped and str(path) == "a":
+            swapped.append(True)
+            inside.rename(a.paths.scratchpad / "old-a")
+            inside.symlink_to(outside, target_is_directory=True)
+        return opened(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(host_files.os, "open", swap_then_open)
+    with pytest.raises(ContainerFileSystemError):
+        await a.list_directory(_cp(a, "/workspace/scratchpad/a/b"))
+    assert swapped

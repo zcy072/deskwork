@@ -54,6 +54,9 @@ SPAWN_HANDSHAKE_TIMEOUT = 10.0
 # (那样 --die-with-parent 的父进程又跑到容器外了),末尾的 exit $? 也防止
 # 某些 sh 把最后一条命令 exec 掉。
 SPAWN_WRAPPER = '"$@"; exit $?'
+# 杀掉 bwrap 后轮询确认进程消失:SIGKILL 是异步的
+STOP_CONFIRM_POLLS = 20
+STOP_CONFIRM_INTERVAL = 0.1
 
 # 通道前缀:二进制帧首字节标识流
 CH_STDIN, CH_STDOUT, CH_STDERR = 0, 1, 2
@@ -321,18 +324,34 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
         stderr=asyncio.subprocess.PIPE,
     )  # fmt: skip
 
-    async def kill_in_container() -> None:
-        """杀掉容器内这次启动的 bwrap(--unshare-pid 保证其下所有进程一并消失)。
+    pattern = f"^bwrap --setenv DESKWORK_SPAWN_ID {spawn_id} "
 
-        `docker exec` 的客户端退出并不会终止容器里的进程,所以必须显式清理。
-        """
-        killer = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-u", AGENT_USER, CONTAINER,
-            "pkill", "-KILL", "-f", "--", f"^bwrap --setenv DESKWORK_SPAWN_ID {spawn_id} ",
+    async def in_container(*cmd: str) -> int:
+        child = await asyncio.create_subprocess_exec(
+            "docker", "exec", "-u", AGENT_USER, CONTAINER, *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )  # fmt: skip
-        await killer.wait()
+        return await child.wait()
+
+    async def kill_in_container() -> bool:
+        """杀掉容器内这次启动的 bwrap(--unshare-pid 保证其下所有进程一并消失),返回是否确认已停止。
+
+        `docker exec` 的客户端退出并不会终止容器里的进程,所以必须显式清理。pkill 返回 0(已杀)
+        或 1(没有匹配,早已退出)之外的码说明没执行成功;之后用 pgrep 确认进程确实不在了。
+        """
+        try:
+            if await in_container("pkill", "-KILL", "-f", "--", pattern) not in (0, 1):
+                return False
+            for _ in range(STOP_CONFIRM_POLLS):
+                if await in_container("pgrep", "-f", "--", pattern) == 1:
+                    return True
+                await asyncio.sleep(STOP_CONFIRM_INTERVAL)
+        except Exception:
+            audit_log.exception("kill_in_container failed")
+        return False
+
+    stop_state: dict[str, bool | None] = {"stopped": None}
 
     async def pump(stream: asyncio.StreamReader, channel: int) -> None:
         while chunk := await stream.read(65536):
@@ -353,7 +372,7 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
                     break  # docker exec 已退出;照常清理容器里可能残留的 bwrap
             elif message.get("text") == "terminate":
                 break
-        await kill_in_container()
+        stop_state["stopped"] = await kill_in_container()
         if proc.returncode is None:
             proc.terminate()
 
@@ -365,7 +384,11 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
     try:
         await proc.wait()
         await asyncio.gather(*readers, return_exceptions=True)
-        await ws.send_text(json.dumps({"exit": proc.returncode}))
+        # docker exec 客户端退出不等于容器内的 bwrap 已结束:没经 terminate 确认过就再确认一次
+        stopped = stop_state["stopped"]
+        if not stopped:
+            stopped = await kill_in_container()
+        await ws.send_text(json.dumps({"exit": proc.returncode, "stopped": stopped}))
         await ws.close()
     except Exception:
         pass
@@ -374,7 +397,7 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
         for task in readers:
             task.cancel()
         await asyncio.gather(reader_in, *readers, return_exceptions=True)
-        audit("spawn", "end", started, session=session, exit=proc.returncode)
+        audit("spawn", "end", started, session=session, exit=proc.returncode, stopped=stop_state["stopped"])
         if proc.returncode is None:
             # 仅在进程仍在运行(异常断连)时清理;正常退出后命名空间已消失
             await kill_in_container()

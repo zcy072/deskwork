@@ -11,6 +11,7 @@ snapshots.py,与 sandbox-manager 的 HTTP / WebSocket 通信见 manager_client.p
 """
 
 import asyncio
+import contextlib
 import hashlib
 import os
 import secrets
@@ -19,6 +20,7 @@ import shutil
 import time
 from asyncio import StreamReader
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import settings
@@ -34,7 +36,7 @@ from app.sandbox.constants import (
     SPILL_MAX_CHARS,
     WRITABLE_SESSION_SUBDIRS,
 )
-from app.sandbox.errors import ContainerFileSystemError
+from app.sandbox.errors import ContainerFileSystemError, SandboxStopUnconfirmed
 from app.sandbox.manager_client import ManagerClient, RemoteProcess, cap_timeout
 from app.sandbox.quota import MB, is_cleanup_command, over_quota_message, session_usage
 from app.sandbox.session_paths import SessionPaths
@@ -51,6 +53,13 @@ USAGE_CACHE_SEC = 10.0
 
 # 单条命令累计输出上限(字节),超过即杀掉 shell,防止 `yes` 之类的命令撑爆后端内存
 MAX_COMMAND_OUTPUT_BYTES = 20 * 1024 * 1024
+
+
+@dataclass
+class StopState:
+    """一旦有沙箱进程没能确认停止就置位,直到服务重启(届时 manager 侧连接已断、进程被清)。"""
+
+    unconfirmed: bool = False
 
 
 class OutputLimitExceeded(Exception):
@@ -95,6 +104,15 @@ class BashSession:
         self._sentinel = BASH_SENTINEL
         self.last_used = time.monotonic()
         self._usage: tuple[float, int] | None = None  # (测量时刻, 字节数)
+        # 与只读子 shell 共享:任一进程没能确认停止,整个工作区都不能再执行命令或改文件
+        self.stop_state = StopState()
+
+    def ensure_usable(self) -> None:
+        """之前有沙箱进程没确认停止时拒绝继续;它可能还在改工作区。"""
+        if self.stop_state.unconfirmed:
+            raise SandboxStopUnconfirmed(
+                "沙箱进程未能确认已停止,本会话暂不能执行命令或修改文件,请重启服务后重试"
+            )
 
     def validate_command(self, command: str) -> tuple[bool, str | None]:
         return self.validator.validate(
@@ -111,6 +129,7 @@ class BashSession:
         command_digest = hashlib.sha256(command.encode()).hexdigest()[:12]
 
         async with self.workspace_lock, self._lock, self._cleanup_on_cancel():
+            self.ensure_usable()
             self.last_used = time.monotonic()
             # 校验依赖当前 cwd,必须在拿到锁之后:排队期间前一条命令可能已经 cd 走了
             ok, reason = self.validate_command(command)
@@ -206,7 +225,10 @@ class BashSession:
             yield
         except asyncio.CancelledError:
             logger.info("Session %s cancelled, killing sandbox shell", self.paths.session_id)
-            await asyncio.shield(self._stop())
+            # 再次取消也要等停止结束才退出:退出即释放工作区锁,进程还活着时不能放行写入。
+            # 停止失败已记在 stop_state 里,这里仍按取消向上传播。
+            with contextlib.suppress(SandboxStopUnconfirmed):
+                await complete_before_cancelling(asyncio.create_task(self._stop()))
             raise
 
     async def _session_usage(self, *, reuse: bool) -> int:
@@ -224,6 +246,7 @@ class BashSession:
 
     async def reset(self) -> str:
         async with self._lock, self._cleanup_on_cancel():
+            self.ensure_usable()
             await self._stop()
             self._current_cwd = self.paths.virtual_scratchpad
             await self._ensure_started()
@@ -234,6 +257,7 @@ class BashSession:
             self.paths, self.container_name, self.validator, self.manager_client, readonly=True
         )
         child.workspace_lock = self.workspace_lock
+        child.stop_state = self.stop_state
         try:
             return await child.execute(command, timeout)
         finally:
@@ -300,6 +324,14 @@ class BashSession:
         except ValueError as exc:
             raise ContainerFileSystemError(str(exc)) from exc
 
+    def _host_path_and_root(self, container_path: str) -> tuple[Path, Path]:
+        """宿主路径与它的可信根;底层按根逐段 O_NOFOLLOW 打开,中间目录被换成链接也读不到外面。"""
+        try:
+            virtual = self.paths.container_to_virtual_path(container_path)
+            return self.paths.virtual_to_host_path(virtual), self.paths.trusted_root(virtual)
+        except ValueError as exc:
+            raise ContainerFileSystemError(str(exc)) from exc
+
     async def path_exists(self, container_path: str) -> bool:
         return await file_io(lambda: self._host_path(container_path).exists())
 
@@ -311,17 +343,19 @@ class BashSession:
 
     async def read_container_file(self, container_path: str, *, strict: bool = False) -> str:
         """strict=True 时非 UTF-8 内容抛 UnicodeDecodeError,供要写回的编辑操作使用。"""
-        data = await file_io(lambda: host_files.read_regular_file(self._host_path(container_path)))
+        data = await file_io(
+            lambda: host_files.read_regular_file(*self._host_path_and_root(container_path))
+        )
         return data.decode("utf-8", errors="strict" if strict else "replace")
 
     async def list_directory(self, container_path: str) -> str:
-        return await file_io(lambda: host_files.list_dir(self._host_path(container_path)))
+        return await file_io(lambda: host_files.list_dir(*self._host_path_and_root(container_path)))
 
     async def copy_to_host(self, container_path: str, host_dest: Path) -> None:
         """经 sandbox-manager 读出容器内文件写到 host_dest;宿主侧读不到源文件时的兜底。"""
-        await self.manager_client.copy_from_container(
-            self.container_name, container_path, host_dest
-        )
+        data = await self.manager_client.read_from_container(self.container_name, container_path)
+        # host_dest 在 agent 可写的 output 下:从会话根逐段打开再原子替换,不跟随链接
+        await file_io(host_files.write_file, host_dest, data, False, self.paths.session_root)
 
     def validate_writable_path(self, container_path: str) -> None:
         relative = self._container_path_to_relative(container_path)
@@ -380,6 +414,7 @@ class BashSession:
                 f"Path '{container_path}' is not in a writable directory"
             )
         data = content.encode("utf-8")
+        self.ensure_usable()
         await file_io(
             host_files.write_file, host_path, data, mkdir_parents, self.paths.session_root
         )
@@ -396,6 +431,7 @@ class BashSession:
         if not settings.SNAPSHOT_KEEP:
             return False
         async with self.workspace_lock:
+            self.ensure_usable()
             sid = self.paths.session_id
             size, fingerprint = await file_io(snapshot_manifest, self.paths.session_root)
             if size > settings.SNAPSHOT_MAX_MB * MB:
@@ -424,6 +460,7 @@ class BashSession:
         sid = self.paths.session_id
         script = restore_script(self.paths.container_root, prompt_id)
         async with self.workspace_lock, self._lock:
+            self.ensure_usable()
             # 命令行里的工作目录可能在被清掉的子目录里,先关掉 shell,下次执行时会重新启动
             await self._stop()
             try:
@@ -452,6 +489,7 @@ class BashSession:
         不经过命令校验和配额检查:只给后端自己拼的固定命令用,不要传入模型给的命令。
         """
         async with self.workspace_lock:
+            self.ensure_usable()
             return await self._run_isolated(command, timeout)
 
     async def _run_isolated(self, command: str, timeout: int | None) -> tuple[str, bool]:
@@ -565,9 +603,20 @@ class BashSession:
         if self._process is not None:
             try:
                 await self.manager_client.terminate(self._process)
+            except Exception as exc:
+                # 没能确认停止:进程可能还在跑。记下状态后不再复用这个 shell,也不放行后续操作
+                self.stop_state.unconfirmed = True
+                logger.error(
+                    "Sandbox shell of session %s did not confirm stop: %r",
+                    self.paths.session_id,
+                    exc,
+                )
+                raise SandboxStopUnconfirmed("sandbox shell did not confirm stop") from exc
             finally:
                 self._process = None
-        await self._drain_queue()
+                await self._drain_queue()
+        else:
+            await self._drain_queue()
 
     async def _drain_queue(self) -> None:
         while True:
@@ -613,14 +662,17 @@ class BashSession:
         ended = 0  # 已读完(EOF)的流数;全部读完说明 shell 已经退出
         deadline = time.monotonic() + timeout
 
-        while time.monotonic() < deadline:
+        while True:
             if self._output_exceeded or getattr(self._process, "output_limit_exceeded", False):
                 raise OutputLimitExceeded
             if ended and ended >= len(self._reader_tasks):
                 raise ShellExited(getattr(self._process, "returncode", None))
+            # 截止判断只在这一处:之前分两次读时钟,中间跨过截止会被当成正常结束
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                break
+                await self._stop()
+                await self._ensure_started()
+                return "", True, None
             try:
                 label, line = await asyncio.wait_for(self._output_queue.get(), timeout=remaining)
             except TimeoutError:
@@ -644,10 +696,6 @@ class BashSession:
                 stdout_lines.append(stripped)
             else:
                 stderr_lines.append(stripped)
-        else:
-            await self._stop()
-            await self._ensure_started()
-            return "", True, None
 
         output = self._beautify_output(stdout_lines, stderr_lines)
         if code:
@@ -760,7 +808,11 @@ class BashSessionsManager:
         closed = 0
         for session in alive:
             idle = idle_sec and now - session.last_used > idle_sec
-            if (idle or closed < excess) and await session.close_if_idle():
+            try:
+                stopped = (idle or closed < excess) and await session.close_if_idle()
+            except SandboxStopUnconfirmed:
+                continue  # 已记在会话的 stop_state 上,该会话之后的操作会被拒绝
+            if stopped:
                 closed += 1
                 logger.info("Closed idle sandbox shell of session %s", session.paths.session_id)
         return closed
@@ -787,6 +839,10 @@ class BashSessionsManager:
         # 宿主侧删不干净(文件属主不一致等)时,再让 manager 以 root 清一遍
         if paths.session_root.exists():
             await self._manager_client.remove_session(self.container_name, paths.container_root)
+
+    def stop_unconfirmed(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        return bool(session and session.stop_state.unconfirmed)
 
     async def bash_tool_helper(
         self,

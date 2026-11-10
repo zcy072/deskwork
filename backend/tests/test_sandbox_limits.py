@@ -71,6 +71,10 @@ class FakeWS:
     def __init__(self, frames):
         self.frames = frames
         self.closed = False
+        self.sent = []
+
+    async def send(self, frame):
+        self.sent.append(frame)
 
     def __aiter__(self):
         return self._iter()
@@ -91,8 +95,10 @@ async def test_remote_process_closes_on_unread_buffer(monkeypatch):
     proc = RemoteProcess(ws)
     await asyncio.wait_for(proc._closed.wait(), timeout=5)
     assert proc.output_limit_exceeded
-    assert ws.closed
+    # 请求 manager 终止(以便拿到"已停止"回执),而不是直接断开连接
+    assert ws.sent == ["terminate"]
     assert proc.returncode == -1
+    assert not proc.stopped
 
 
 async def test_remote_process_normal_output_unaffected():

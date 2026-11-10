@@ -12,7 +12,7 @@ vi.mock('@/api/client', () => ({
     }
   },
   SendUncertainError: class SendUncertainError extends Error {
-    constructor(public requestId: string, cause: unknown) { super(String(cause)) }
+    constructor(public requestId: string, cause: unknown, public retryRejected = false) { super(String(cause)) }
   },
   getAcceptedRun: vi.fn(),
   sendMessage: vi.fn(),
@@ -170,6 +170,38 @@ describe('send', () => {
 
     expect(await chat.send('新', [])).toBe(false)
     expect(chat.messages.map((x) => x.id)).toEqual(['5'])
+  })
+
+  it('重试被拒绝后按原请求 ID 查回执并接回那一轮', async () => {
+    m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', new Error('busy'), true))
+    m.getAcceptedRun.mockResolvedValueOnce(null).mockResolvedValueOnce({ status: 'running', id: 'p9' })
+    m.streamEvents.mockReturnValue(packets(token('回来了'), end))
+    const chat = useChatStore()
+
+    expect(await chat.send('问', [])).toBe(true)
+
+    expect(m.getAcceptedRun).toHaveBeenCalledWith(expect.anything(), 'request-1')
+    expect(m.streamEvents).toHaveBeenCalledWith(expect.anything(), 'p9', expect.anything())
+    expect(chat.error).toBeNull()
+  })
+
+  it('重试被拒绝且回执一直查不到时保持未知,不把消息退回', async () => {
+    vi.useFakeTimers()
+    try {
+      m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', new Error('busy'), true))
+      const chat = useChatStore()
+      chat.messages = [{ id: 'a', role: 'user', parts: [{ type: 'text', text: '旧' }] }]
+
+      const sent = chat.send('新', [])
+      await vi.runAllTimersAsync()
+
+      expect(await sent).toBe(true)
+      expect(m.getAcceptedRun.mock.calls.length).toBeGreaterThan(1)
+      expect(chat.messages.map((x) => x.parts)).toContainEqual([{ type: 'text', text: '新' }])
+      expect(chat.error).toContain('无法确认')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('服务端明确拒绝时不查线程状态', async () => {

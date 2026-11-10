@@ -141,6 +141,11 @@ class SessionPaths:
             return self._resolve_global_path(DEFAULT_SKILLS_DIR, rel)
         return self.resolve_host_path(rel)
 
+    def trusted_root(self, virtual_path: str) -> Path:
+        """The root a host-side open must start from: session dir or global skills dir."""
+        is_skills, _ = self._resolve_virtual(virtual_path)
+        return DEFAULT_SKILLS_DIR if is_skills else self.session_root
+
     def virtual_to_container_path(self, virtual_path: str) -> str:
         """Map /workspace/... to the physical container path for docker exec.
 

@@ -26,6 +26,7 @@ from app.agents.skills_helper import get_skills_xml
 from app.config import settings
 from app.db import is_db_ready, repository
 from app.owner import current_owner
+from app.sandbox.errors import SandboxStopUnconfirmed
 from app.services.budget import BudgetExceeded
 from app.services.mcp_client import confirm_tool_names, mcp_tool_names
 from app.services.memory import INJECT_LIMIT, format_for_prompt, select_memories
@@ -274,6 +275,9 @@ class ToolGuardMiddleware(AgentMiddleware):
             raise
         except GraphBubbleUp:
             # interrupt() 等控制流信号,不是工具失败
+            raise
+        except SandboxStopUnconfirmed:
+            # 沙箱进程没确认停止:结束本轮,由运行收尾保留会话占用
             raise
         except Exception:
             # 多数工具自己把错误转成结果;漏出来的(MCP 连接断开、数据库错误等)也交给模型处理,

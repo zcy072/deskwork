@@ -254,11 +254,19 @@ def test_file_too_large_is_rejected(tmp_path, monkeypatch):
         assert resp.status_code == status, name
 
 
+def _exit_code(code):
+    from types import SimpleNamespace
+
+    async def wait():
+        return code
+
+    return SimpleNamespace(wait=wait)
+
+
 @pytest.mark.parametrize("disconnect", [False, True])
 def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
     """结束时按本次的唯一标记杀 bwrap,不按会话目录匹配(会误杀同会话并行的 bwrap)。"""
     import asyncio
-    from types import SimpleNamespace
 
     calls = []
 
@@ -292,7 +300,10 @@ def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
 
     async def fake_exec(*args, **_kw):
         calls.append(args)
-        return FakeProc() if "-i" in args else SimpleNamespace(wait=lambda: asyncio.sleep(0))
+        if "-i" in args:
+            return FakeProc()
+        # pkill 杀掉了(0);pgrep 找不到(1)表示确认已停止
+        return _exit_code(0 if "pkill" in args else 1)
 
     monkeypatch.setattr(manager.asyncio, "create_subprocess_exec", fake_exec)
     spec = {
@@ -306,7 +317,7 @@ def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
             ws.close()
         else:
             ws.send_bytes(b"\x00echo hi\n")  # stdin 已断:应当照常清理而不是抛异常
-            assert json.loads(ws.receive_text()) == {"exit": -15}
+            assert json.loads(ws.receive_text()) == {"exit": -15, "stopped": True}
     spawned, killer = calls[0], calls[1]
     # bwrap 由一层 sh 托着(不直接当 docker exec 的进程,见 manager 注释)
     i = spawned.index("bwrap")
@@ -328,6 +339,55 @@ def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
     assert bwrap[4:] == tuple(spec["argv"][1:])
     assert killer[-1] == f"^bwrap --setenv DESKWORK_SPAWN_ID {bwrap[3]} "
     assert "s1" not in killer[-1]
+
+
+@pytest.mark.parametrize(
+    ("pkill", "pgrep", "stopped"),
+    [(0, 1, True), (1, 1, True), (2, 1, False), (0, 0, False)],
+)
+def test_spawn_receipt_reports_confirmed_stop(monkeypatch, pkill, pgrep, stopped):
+    """R12:pkill 失败或 pgrep 仍找得到进程时,回执不能声称已停止。"""
+    import asyncio
+
+    monkeypatch.setattr(manager, "STOP_CONFIRM_POLLS", 2)
+    monkeypatch.setattr(manager, "STOP_CONFIRM_INTERVAL", 0)
+
+    class FakeStream:
+        async def read(self, _n):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = None
+            self.stdout, self.stderr = FakeStream(), FakeStream()
+            self._done = asyncio.Event()
+
+        async def wait(self):
+            await self._done.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self._done.set()
+
+        kill = terminate
+
+    async def fake_exec(*args, **_kw):
+        if "-i" in args:
+            return FakeProc()
+        return _exit_code(pkill if "pkill" in args else pgrep)
+
+    monkeypatch.setattr(manager.asyncio, "create_subprocess_exec", fake_exec)
+    spec = {
+        "container": "sandbox",
+        "user": "agent",
+        "argv": ["bwrap", "--bind", "/sandbox_data/sessions/s1/output", "/w", "bash"],
+    }
+    with client.websocket_connect("/spawn", headers=AUTH) as ws:
+        ws.send_text(json.dumps(spec))
+        ws.send_text("terminate")
+        assert json.loads(ws.receive_text()) == {"exit": -15, "stopped": stopped}
 
 
 def test_spawn_handshake_timeout_releases_slot(monkeypatch):

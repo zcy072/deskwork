@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.agents.context import RunContext, session_id_of
 from app.sandbox import CONTAINER_MANAGER
 from app.sandbox.constants import COMMAND_TIMEOUT_SEC
-from app.sandbox.errors import ContainerFileSystemError
+from app.sandbox.errors import ContainerFileSystemError, SandboxStopUnconfirmed
 from app.tools.executor import (
     MAX_VIEW_MAX_CHARS,
     create_container_file,
@@ -62,6 +62,8 @@ def _file_errors_as_feedback(action: str):
             runtime = kwargs["runtime"]
             try:
                 return await fn(*args, **kwargs)
+            except SandboxStopUnconfirmed:
+                raise  # 进程可能还活着,不能当普通工具错误继续这一轮
             except ContainerFileSystemError as exc:
                 return _file_tool_response(runtime, f"Error: {exc}", is_error=True)
             except Exception:
@@ -112,6 +114,8 @@ async def bash_tool(
             )
         # 命令和输出预览已由 BashSession.execute 记录
         logger.debug("bash_tool completed: is_error=%s chars=%d", is_error, len(feedback))
+    except SandboxStopUnconfirmed:
+        raise
     except Exception:
         logger.exception("Error executing command")
         feedback = f"命令执行失败(trace id: {get_trace_id()})"

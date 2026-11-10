@@ -257,9 +257,12 @@ async def _present_container_files(
             archived = await file_io(_prepare_dest, session.paths, host_dest)
             try:
                 host_src = session.paths.virtual_to_host_path(virtual_path)
+                src_root = session.paths.trusted_root(virtual_path)
             except ValueError:
-                host_src = None
-            if host_src is None or not await file_io(_copy_local, host_src, host_dest):
+                host_src = src_root = None
+            if host_src is None or not await file_io(
+                _copy_local, host_src, host_dest, src_root, session.paths.session_root
+            ):
                 await session.copy_to_host(container_path, host_dest)
             retained = await file_io(finish_archive, session.paths, host_dest, archived)
             if not retained:
@@ -272,7 +275,9 @@ async def _present_container_files(
             }
             # 摘要让历史消息能找回这次交付的内容,而不是之后被覆盖的最新版
             with suppress(OSError):
-                record["sha256"], size = await file_io(digest_file, host_dest)
+                record["sha256"], size = await file_io(
+                    digest_file, session.paths.session_root, host_dest
+                )
                 record["size"] = size
             records.append(record)
             messages.append(f"Presented {file_name}" + (f"\n{warning}" if warning else ""))
@@ -286,13 +291,12 @@ def _prepare_dest(paths, host_dest: Path):
     return archive_previous(paths, host_dest)
 
 
-def _copy_local(host_src: Path, host_dest: Path) -> bool:
+def _copy_local(host_src: Path, host_dest: Path, src_root: Path, dest_root: Path) -> bool:
     """源文件在宿主机上可直接读时就地复制,返回 True;否则返回 False 交给沙箱复制。"""
     if not host_src.is_file() or host_src.is_symlink():
         return False
-    if host_src.resolve() != host_dest.resolve():
-        host_dest.parent.mkdir(parents=True, exist_ok=True)
-        copy_file_atomic(host_src, host_dest)
+    if host_src != host_dest:
+        copy_file_atomic(host_src, host_dest, dest_root, src_root)
     return True
 
 
@@ -307,11 +311,12 @@ async def _validate_source(session, virtual_path: str, session_id: str, file_nam
     连续失败达到上限则放行并返回警告文本。没有宿主机路径可读时跳过检查。"""
     try:
         host_src = session.paths.virtual_to_host_path(virtual_path)
+        root = session.paths.trusted_root(virtual_path)
     except ValueError:
         return ""
     if not host_src.is_file() or host_src.is_symlink():
         return ""
-    problem = await file_io(check_deliverable, host_src)
+    problem = await file_io(check_deliverable, host_src, root)
     key = (session_id, file_name)
     if problem is None:
         _check_failures.pop(key, None)

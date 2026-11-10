@@ -74,6 +74,7 @@ async def test_present_archives_previous(paths, monkeypatch):
             virtual_root="/workspace",
             virtual_to_container_path=lambda v: v,
             virtual_to_host_path=lambda v: src,
+            trusted_root=lambda v: paths.session_root,
         ),
         resolve_virtual_path=lambda raw: "/workspace/scratchpad/a.txt",
         manager_client=None,
@@ -153,14 +154,12 @@ def test_failed_snapshot_copy_keeps_last_successful_delivery(paths, monkeypatch)
     _overwrite(paths, "v1", 1_000)
     dest = paths.output / "a.txt"
     dest.write_text("v2")
-    real_copy = fv.shutil.copy2
+    from app.sandbox import host_files
 
-    def fail_current(source, target):
-        if target.name.startswith(".delivery-"):
-            raise OSError("disk full")
-        return real_copy(source, target)
+    def fail_copy(_src, _dst, _length=0):
+        raise OSError("disk full")
 
-    monkeypatch.setattr(fv.shutil, "copy2", fail_current)
+    monkeypatch.setattr(host_files.shutil, "copyfileobj", fail_copy)
     fv.finish_archive(paths, dest, fv.archive_previous(paths, dest))
     directory = paths.session_root / "versions" / "a.txt"
     assert (directory / fv.CURRENT).read_text() == "v1"
@@ -245,6 +244,7 @@ async def test_present_records_digest(paths, monkeypatch):
             virtual_root="/workspace",
             virtual_to_container_path=lambda v: v,
             virtual_to_host_path=lambda v: src,
+            trusted_root=lambda v: paths.session_root,
         ),
         resolve_virtual_path=lambda raw: "/workspace/scratchpad/a.txt",
         manager_client=None,

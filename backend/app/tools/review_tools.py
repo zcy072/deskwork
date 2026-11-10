@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.agents.context import RunContext, session_id_of
 from app.services.budget import BudgetExceeded
 from app.services.doc_review import render_pages, review_pages
-from app.utils import logger
+from app.services.tool_feedback import error_feedback
 
 REVIEW_DOCUMENT_DESCRIPTION = """Visually check a generated deliverable (docx / pptx / xlsx / pdf) for layout problems.
 
@@ -46,10 +46,9 @@ async def review_document(
     except (BudgetExceeded, GraphBubbleUp):
         raise
     except Exception as exc:
-        logger.error(f"review_document failed: {exc}")
         status = "error"
         feedback = (
-            f"Error: {exc}\nThe automatic layout check is unavailable; "
+            f"{error_feedback('review_document', exc)}\nThe automatic layout check is unavailable; "
             "continue without it and mention that the layout was not verified."
         )
     return Command(

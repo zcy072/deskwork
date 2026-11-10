@@ -13,6 +13,8 @@ from langchain_core.messages import HumanMessage
 from app.agents.llms import get_named_model
 from app.config import settings
 from app.sandbox import CONTAINER_MANAGER
+from app.sandbox.errors import ContainerFileSystemError
+from app.services.tool_feedback import ToolFeedbackError
 from app.utils import logger
 
 IMAGE_MIME = {
@@ -54,33 +56,33 @@ def message_text(content) -> str:
 
 
 async def load_image(session_id: str, path: str) -> tuple[bytes, str]:
-    """返回 (图片字节, MIME)。出错抛 RuntimeError,信息直接给模型看。"""
+    """返回 (图片字节, MIME)。出错抛 ToolFeedbackError,信息直接给模型看。"""
     session = await CONTAINER_MANAGER.get_or_create(session_id)
     try:
         virtual = session.resolve_virtual_path(path)
-    except Exception as exc:
-        raise RuntimeError(str(exc)) from exc
+    except (ContainerFileSystemError, ValueError) as exc:  # 路径校验的提示是写给模型的
+        raise ToolFeedbackError(str(exc)) from exc
     suffix = posixpath.splitext(virtual)[1].lower()
     if suffix not in IMAGE_MIME:
-        raise RuntimeError(
+        raise ToolFeedbackError(
             f"不支持的图片格式 {suffix or '(无扩展名)'},仅支持 png/jpg/jpeg/webp/gif"
         )
     rel = virtual[len(session.paths.virtual_root) :].lstrip("/")
     if rel.split("/", 1)[0] not in ALLOWED_DIRS:
-        raise RuntimeError("只能查看 /workspace/uploads 或 /workspace/output 下的图片")
+        raise ToolFeedbackError("只能查看 /workspace/uploads 或 /workspace/output 下的图片")
 
     limit = settings.VIEW_IMAGE_MAX_MB * 1024 * 1024
     try:
         host_path = session.paths.virtual_to_host_path(virtual)
         data = await asyncio.to_thread(session.paths.read_host_file, host_path, limit + 1)
     except FileNotFoundError as exc:
-        raise RuntimeError(f"File not found: {virtual}") from exc
+        raise ToolFeedbackError(f"File not found: {virtual}") from exc
     except (OSError, ValueError) as exc:
-        raise RuntimeError(f"读取图片失败: {exc}") from exc
+        raise ToolFeedbackError("读取图片失败") from exc
     if not data:
-        raise RuntimeError(f"图片是空文件: {virtual}")
+        raise ToolFeedbackError(f"图片是空文件: {virtual}")
     if len(data) > limit:
-        raise RuntimeError(f"图片超过大小上限 {settings.VIEW_IMAGE_MAX_MB} MB: {virtual}")
+        raise ToolFeedbackError(f"图片超过大小上限 {settings.VIEW_IMAGE_MAX_MB} MB: {virtual}")
     return data, IMAGE_MIME[suffix]
 
 

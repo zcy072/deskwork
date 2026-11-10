@@ -111,6 +111,7 @@ def session(tmp_path, monkeypatch):
             virtual_root="/workspace",
             virtual_to_container_path=lambda v: v,
             virtual_to_host_path=lambda v: src,
+            trusted_root=lambda v: paths.session_root,
         ),
         resolve_virtual_path=lambda raw: "/workspace/scratchpad/a.docx",
         manager_client=None,

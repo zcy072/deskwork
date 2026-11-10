@@ -8,6 +8,7 @@ from langgraph.types import Command
 
 from app.utils import logger
 
+NULL_TASK_ID = "00000000-0000-0000-0000-000000000000"
 USER_CANCELLED_TOOL_MESSAGE = "Execution cancelled by user."
 INTERRUPTED_TOOL_MESSAGE = "Execution was interrupted before this tool call finished."
 
@@ -16,16 +17,26 @@ class ResumeConflictError(ValueError):
     pass
 
 
-async def fork_answered_interrupt(agent, config: dict, snapshot, destination: str) -> dict:
-    """Copy history without replaying completed siblings or reusing old answers."""
+async def fork_answered_interrupt(
+    agent, config: dict, snapshot, destination: str, discard: set[str] | None = None
+) -> dict:
+    """Copy history without replaying completed siblings or reusing rewound answers.
+
+    Parallel answers share one checkpoint; each is a task's pending writes there.
+    ``discard`` names the interrupts whose answers are rewound (the target and
+    later answers). Earlier answers stay. ``None`` (legacy runs that did not
+    record their interrupt) clears every answer at the pause.
+    """
     saver = agent.checkpointer
-    interrupted = {t.id for t in snapshot.tasks if t.interrupts}
+    interrupt_ids = {i.id for task in snapshot.tasks for i in task.interrupts}
+    if discard is not None:
+        interrupt_ids &= discard
+    interrupted = {t.id for t in snapshot.tasks if any(i.id in interrupt_ids for i in t.interrupts)}
     cid = config["configurable"]["checkpoint_id"]
     source = config["configurable"]["thread_id"]
     rows = [row async for row in saver.alist({"configurable": {"thread_id": source}}, limit=20001)]
     if len(rows) > 20000:
         raise ResumeConflictError("执行历史过大,无法安全复制这条确认的恢复点")
-    interrupt_ids = {i.id for task in snapshot.tasks for i in task.interrupts}
     heads = {"": cid}
     interrupted_tasks = {"": interrupted}
     # A task-tool interrupt may originate in a nested graph. Restore that graph
@@ -57,10 +68,10 @@ async def fork_answered_interrupt(agent, config: dict, snapshot, destination: st
         writes = defaultdict(list)
         for task_id, channel, value in row.pending_writes or []:
             if namespace in heads and configurable["checkpoint_id"] == heads[namespace]:
-                if channel == "__resume__" or (
-                    task_id in interrupted_tasks[namespace] and channel != "__interrupt__"
-                ):
-                    continue
+                if task_id == NULL_TASK_ID and channel == "__resume__":
+                    continue  # a thread-wide resume map would re-answer rewound questions
+                if task_id in interrupted_tasks[namespace] and channel != "__interrupt__":
+                    continue  # includes the task's __resume__ answer
             writes[task_id].append((channel, value))
         for task_id, values in writes.items():
             await saver.aput_writes(copied, values, task_id)
@@ -120,6 +131,16 @@ async def _repair_cancelled_tool_calls(
         updated = await agent.aupdate_state(config, {"messages": missing_messages}, as_node="tools")
         if config["configurable"].get("checkpoint_id") and updated:
             config["configurable"].update(updated["configurable"])
+
+
+def resumed_interrupt_id(command: Command | None, snapshot) -> str | None:
+    """The interrupt a resume Command answers, recorded so a rewind keeps earlier answers."""
+    if command is None:
+        return None
+    if isinstance(command.resume, dict):
+        return next(iter(command.resume), None)
+    pending = _unanswered_interrupts(snapshot)
+    return pending[0].id if pending else None
 
 
 def _unanswered_interrupts(snapshot) -> list:

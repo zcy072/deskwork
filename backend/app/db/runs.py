@@ -219,11 +219,14 @@ async def start(
     rewind_message_id: int | None = None,
     graph_ref: dict | None = None,
     resume_from: Run | None = None,
+    answered_interrupt: str | None = None,
 ) -> None:
     async with get_session() as db:
         run = await db.get(Run, run_id)
         if run is None or run.status != "preparing":
             raise RuntimeError("Run is not preparing")
+        if answered_interrupt is not None:
+            run.input_json = {**run.input_json, "answered_interrupt": answered_interrupt}
         sid = run.conversation_id
         if rewind_message_id is not None:
             ids = select(Message.id).where(
@@ -276,6 +279,27 @@ async def start(
             .values(last_run_status=None, unread=False, updated_at=datetime.now(UTC))
         )
         await db.commit()
+
+
+async def answers_from(session_id: str, message_id: int) -> set[str] | None:
+    """Interrupts answered by the user message ``message_id`` and every later one.
+
+    None when the target run predates this record: callers then clear every answer.
+    """
+    async with get_session() as db:
+        rows = (
+            await db.scalars(
+                select(Run)
+                .join(Message, and_(Message.prompt_id == Run.id, Message.role == "user"))
+                .where(Message.conversation_id == session_id, Message.id >= message_id)
+                .order_by(Message.id)
+            )
+        ).all()
+    if not rows or "answered_interrupt" not in (rows[0].input_json or {}):
+        return None
+    return {
+        r.input_json["answered_interrupt"] for r in rows if "answered_interrupt" in r.input_json
+    }
 
 
 async def graph_config(session_id: str) -> dict:

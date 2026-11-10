@@ -72,6 +72,10 @@ async def runtime(tmp_path, monkeypatch):
                 )
             return self.sessions[sid]
 
+        def stop_unconfirmed(self, sid):
+            stop_state = getattr(self.sessions.get(sid), "stop_state", None)
+            return bool(stop_state and stop_state.unconfirmed)
+
         async def snapshot_session(self, sid, pid):
             session = await self.get_or_create(sid)
             root = session.paths.session_root / "snapshots" / f"{time.time_ns()}_{pid}"
@@ -625,7 +629,7 @@ async def test_failed_confirmation_fork_is_removed_before_releasing_workspace(ru
     destination = []
 
     async def fork_then_fail(*args):
-        destination.append(args[-1])
+        destination.append(args[3])
         await real_fork(*args)
         raise OSError("copy interrupted")
 

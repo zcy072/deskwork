@@ -8,8 +8,8 @@ from app.agents.context import RunContext, session_id_of
 from app.config import settings
 from app.services.budget import BudgetExceeded
 from app.services.image_view import NOT_CONFIGURED, describe_image, load_image, vision_enabled
+from app.services.tool_feedback import error_feedback
 from app.tools.turn_limits import call_index_this_turn
-from app.utils import logger
 
 TOOL_NAME = "view_image"
 
@@ -59,8 +59,7 @@ async def view_image(
     except (BudgetExceeded, GraphBubbleUp):
         raise
     except Exception as exc:
-        logger.error(f"view_image failed: {exc}")
-        feedback = f"Error: {exc}"
+        feedback = error_feedback("view_image", exc)
     return Command(
         update={
             "messages": [

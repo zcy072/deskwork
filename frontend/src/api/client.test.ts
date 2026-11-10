@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, getApiKey, getThreadStatus, onUnauthorized, sendMessage, setApiKey, streamEvents } from './client'
+import { ApiError, SendUncertainError, getApiKey, getThreadStatus, onUnauthorized, sendMessage, setApiKey, streamEvents } from './client'
 
 beforeEach(() => localStorage.clear())
 afterEach(() => {
@@ -290,6 +290,19 @@ describe('sendMessage', () => {
 
     await expect(sendMessage('s', 'hi', [])).rejects.toBeInstanceOf(ApiError)
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('结果未知后重试被拒绝,不当作原请求被拒绝', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError('network'))
+      .mockResolvedValueOnce(new Response('{"detail":"busy"}', { status: 409 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const error = await sendMessage('s', 'hi', []).catch((e) => e)
+
+    expect(error).toBeInstanceOf(SendUncertainError)
+    expect(error.retryRejected).toBe(true)
+    expect(error.requestId).toBe((fetchMock.mock.calls[0][1].body as FormData).get('client_request_id'))
   })
 
   it('不同的发送使用不同的请求 ID', async () => {

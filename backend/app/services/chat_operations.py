@@ -16,6 +16,7 @@ from app.agents.recovery import (
     _repair_cancelled_tool_calls,
     _resume_command,
     fork_answered_interrupt,
+    resumed_interrupt_id,
 )
 from app.config import settings
 from app.db import is_db_ready, repository
@@ -377,12 +378,23 @@ async def cancel_chat(session_id: str) -> tuple[str, bool]:
         )  # Preparation observes cancel_requested before entering the graph.
     if not task.done() and not task.cancelling():
         task.cancel()
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        if not task.done():
-            raise
+    # 等待任务结束和(未进入图时的)收尾放在同一个独立任务里排空:
+    # 取消请求本身被取消,也不会把会话占用留在半路
+    await complete_before_cancelling(asyncio.create_task(_settle_cancelled(session_id, handle)))
+    status, _ = await get_run_status(session_id)
+    return status or "cancelled", True
+
+
+async def _settle_cancelled(session_id: str, handle) -> None:
+    task = handle.task
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
     if not handle.started:
+        await _finalize_unstarted_run(session_id, handle)
+
+
+async def _finalize_unstarted_run(session_id: str, handle) -> None:
+    try:
         if is_db_ready() and await run_store.get(handle.prompt_id):
             await run_store.save(handle.prompt_id, [], "", 0, {}, "cancelled")
         if handle.prompt_id:
@@ -394,10 +406,9 @@ async def cancel_chat(session_id: str) -> tuple[str, bool]:
                     await mark_done(handle.prompt_id)
         with contextlib.suppress(Exception):
             await set_thread_status(session_id, "cancelled")
-        if handle.operation == "run":
+    finally:
+        if handle.operation == "run" and handle.phase != "recovery_required":
             sessions.release(handle)
-    status, _ = await get_run_status(session_id)
-    return status or "cancelled", True
 
 
 async def get_run_status(session_id: str) -> tuple[str | None, str | None]:
@@ -611,7 +622,11 @@ async def _run_agent(
                     fork_thread = str(uuid.uuid4())
                     await file_io(rewind_operation.set_fork_thread, fork_thread)
                     config["configurable"] = await fork_answered_interrupt(
-                        agent, config, state, fork_thread
+                        agent,
+                        config,
+                        state,
+                        fork_thread,
+                        await run_store.answers_from(session_id, target),
                     )
                     rewind_operation.graph_ref = config["configurable"]
                     state = await agent.aget_state(config)
@@ -646,6 +661,7 @@ async def _run_agent(
                     target,
                     rewind_operation.graph_ref if rewind_operation else None,
                     resume_from=source,
+                    answered_interrupt=resumed_interrupt_id(resume, state),
                 )
                 if source is not None:
                     run.turn_id = source.turn_id
@@ -769,6 +785,13 @@ async def _run_agent(
                     if handle:
                         handle.phase = "recovery_required"
                     logger.exception("Closing graph stream %s failed", prompt_id)
+            if CONTAINER_MANAGER.stop_unconfirmed(session_id):
+                # 沙箱 shell 可能还在改文件:保留会话占用,不让新一轮、删除或回退进来
+                outcome, error_code = "error", "recovery_required"
+                public_error = "无法确认工具执行已停止,请重启服务后重试"
+                if handle:
+                    handle.phase = "recovery_required"
+                logger.error("Run %s ended with an unconfirmed sandbox stop", prompt_id)
             if rewind_operation:
                 try:
                     stored_run = await run_store.get(prompt_id)

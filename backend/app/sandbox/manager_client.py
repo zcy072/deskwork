@@ -3,23 +3,23 @@
 后端不接触 docker.sock,所有容器操作经 HTTP / WebSocket 交给 sandbox-manager:
     WS   /spawn      启动常驻 bwrap shell,帧首字节区分 stdin / stdout / stderr  -> spawn()
     POST /exec       以 agent 用户跑一次性脚本(快照、恢复、隔离命令)        -> run_exec()
-    POST /file       读会话内文件(宿主侧读不到时的兜底)                      -> copy_from_container()
+    POST /file       读会话内文件(宿主侧读不到时的兜底)                      -> read_from_container()
     POST /provision  以 root 修正会话目录权限                                  -> provision_session()
     POST /remove     以 root 删除会话目录                                      -> remove_session()
 容器内的用户固定为 agent,root 操作只有 provision / remove 两个固定动作。
 """
 
 import asyncio
+import contextlib
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 import httpx
 import websockets
 
 from app.sandbox.constants import COMMAND_TIMEOUT_SEC, CONTAINER_AGENT_USER
-from app.sandbox.errors import TransientSandboxError
+from app.sandbox.errors import SandboxStopUnconfirmed, TransientSandboxError
 from app.utils import logger
 
 CH_STDIN, CH_STDOUT, CH_STDERR = 0, 1, 2
@@ -57,6 +57,8 @@ class RemoteProcess:
         self.stdout = asyncio.StreamReader(limit=STREAM_LINE_LIMIT)
         self.stderr = asyncio.StreamReader(limit=STREAM_LINE_LIMIT)
         self.returncode: int | None = None
+        # manager 的结束回执里确认容器内的 bwrap 已经消失才为 True;连接断开而没有回执时保持 False
+        self.stopped = False
         self.output_limit_exceeded = False
         self.close_reason: str | None = None
         self._closed = asyncio.Event()
@@ -66,14 +68,19 @@ class RemoteProcess:
         try:
             async for message in self._ws:
                 if isinstance(message, bytes):
+                    if self.output_limit_exceeded:
+                        continue  # 已请求终止,丢弃剩余输出,继续等结束回执
                     target = self.stdout if message[0] == CH_STDOUT else self.stderr
                     target.feed_data(message[1:])
                     if self._buffered() > MAX_BUFFERED_BYTES:
                         self.output_limit_exceeded = True
-                        await self._ws.close()  # manager 看到断连会清掉容器内的 bwrap
-                        break
+                        # 让 manager 杀掉进程并回执,而不是直接断开:断开就拿不到"已停止"的确认
+                        with contextlib.suppress(websockets.ConnectionClosed):
+                            await self._ws.send("terminate")
                 else:
-                    self.returncode = json.loads(message).get("exit", 0)
+                    receipt = json.loads(message)
+                    self.returncode = receipt.get("exit", 0)
+                    self.stopped = receipt.get("stopped") is True
         except websockets.ConnectionClosed:
             pass
         finally:
@@ -94,17 +101,19 @@ class RemoteProcess:
         await self._ws.send(bytes([CH_STDIN]) + data)
 
     async def terminate(self, grace_sec: float = 5.0) -> None:
-        if self.returncode is None:
-            try:
+        """请求结束并等待 manager 的回执;回执没确认已停止就抛 SandboxStopUnconfirmed。"""
+        if not self._closed.is_set():
+            with contextlib.suppress(websockets.ConnectionClosed):
                 await self._ws.send("terminate")
-            except websockets.ConnectionClosed:
-                pass
-            try:
-                await asyncio.wait_for(self._closed.wait(), timeout=grace_sec)
-            except TimeoutError:
-                pass
-        await self._ws.close()
-        self._task.cancel()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(self._closed.wait()), timeout=grace_sec)
+        if not self._closed.is_set():
+            # 没等到回执:保留连接和接收任务,之后还能再试一次,不当作已停止
+            raise SandboxStopUnconfirmed("sandbox process did not confirm termination")
+        with contextlib.suppress(Exception):
+            await self._ws.close()
+        if not self.stopped:
+            raise SandboxStopUnconfirmed("sandbox-manager could not confirm the process stopped")
 
 
 class ManagerClient:
@@ -173,18 +182,13 @@ class ManagerClient:
         data = resp.json()
         return ExecResult(data["returncode"], data["stdout"], data["stderr"])
 
-    async def copy_from_container(
-        self, container: str, container_path: str, host_path: Path
-    ) -> None:
+    async def read_from_container(self, container: str, container_path: str) -> bytes:
         resp = await self.http.post("/file", json={"container": container, "path": container_path})
         if resp.status_code >= 500:
             raise TransientSandboxError(f"sandbox-manager /file failed: {resp.status_code}")
         if resp.status_code != 200:
-            raise RuntimeError(
-                f"Failed to copy {container_path} to {host_path}: {resp.status_code} {resp.text}"
-            )
-        host_path.parent.mkdir(parents=True, exist_ok=True)
-        host_path.write_bytes(resp.content)
+            raise RuntimeError(f"Failed to read {container_path}: {resp.status_code} {resp.text}")
+        return resp.content
 
     @staticmethod
     async def write_stdin(process: RemoteProcess, data: str) -> None:

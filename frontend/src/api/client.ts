@@ -106,7 +106,11 @@ export class ApiError extends Error {
 }
 
 export class SendUncertainError extends Error {
-  constructor(public requestId: string, cause: unknown) {
+  /**
+   * retryRejected:之前的尝试结果未知,随后的重试被服务端拒绝(如会话忙 409)。
+   * 拒绝的是重试,不能证明原请求没被接受,原请求可能仍在准备。
+   */
+  constructor(public requestId: string, cause: unknown, public retryRejected = false) {
     super(cause instanceof Error ? cause.message : '无法确认请求是否已接受')
   }
 }
@@ -142,8 +146,12 @@ export async function sendMessage(
       const res = await requestJson<{ prompt_id: string }>('/send-message', { method: 'POST', body: form })
       return res.prompt_id
     } catch (e) {
-      // 只重试没拿到 HTTP 响应的网络错误;服务端明确拒绝(ApiError)原样抛出
-      if (e instanceof ApiError) throw e
+      // 只重试没拿到 HTTP 响应的网络错误。首次就被服务端拒绝(ApiError)才是确定的拒绝;
+      // 前面已有结果未知的尝试时,重试的拒绝只说明重试没被接受,交给调用方按 request_id 查回执
+      if (e instanceof ApiError) {
+        if (attempt === 0) throw e
+        throw new SendUncertainError(requestId, e, true)
+      }
       if (attempt >= SEND_RETRIES) throw new SendUncertainError(requestId, e)
       await new Promise((r) => setTimeout(r, SEND_RETRY_DELAY_MS * (attempt + 1)))
     }

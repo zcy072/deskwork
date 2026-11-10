@@ -11,6 +11,9 @@ import { NEW_CONVERSATION, clearDraft, loadDraft, loadDraftFiles, saveDraft } fr
 
 /** 打开会话和向上翻页时每次取的消息条数 */
 export const MESSAGE_PAGE_SIZE = 40
+// 重试被拒绝后等原请求写下回执:最多约 3 秒
+const RECEIPT_POLLS = 6
+const RECEIPT_POLL_MS = 500
 
 function newId(): string {
   return crypto.randomUUID()
@@ -572,6 +575,18 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   /**
+   * 按原 request_id 查持久回执。重试被拒绝说明原请求可能还在准备、尚未写下回执,多等几次。
+   */
+  async function acceptedReceipt(sid: string, e: api.SendUncertainError) {
+    const attempts = e.retryRejected ? RECEIPT_POLLS : 1
+    for (let i = 0; ; i++) {
+      const recorded = await api.getAcceptedRun(sid, e.requestId)
+      if (recorded || i + 1 >= attempts) return recorded
+      await new Promise((r) => setTimeout(r, RECEIPT_POLL_MS))
+    }
+  }
+
+  /**
    * 发送消息。rewindTo 为某条用户消息的数据库 id 时,先让服务端回退到该消息之前再发送:
    * 本地同步丢弃它及之后的消息,请求失败则还原。
    */
@@ -614,6 +629,7 @@ export const useChatStore = defineStore('chat', () => {
     const sid = sessionId.value
     const mine = (abort = new AbortController())
     let accepted = false
+    let uncertain = false
     let finishedElsewhere = false
     try {
       let promptId: string | null
@@ -633,8 +649,16 @@ export const useChatStore = defineStore('chat', () => {
         // 没拿到响应的网络错误:服务端可能已接受并开始生成,线程在运行就接回那一轮;
         // 已经跑完的,看服务端是否记下了这条消息,记下了就别把文字还给输入框
         if (!(e instanceof api.SendUncertainError)) throw e
-        const recorded = await api.getAcceptedRun(sid, e.requestId)
-        if (!recorded) throw e
+        const recorded = await acceptedReceipt(sid, e)
+        if (!recorded) {
+          // 重试被拒绝而原请求的回执还查不到:原请求可能仍在准备,不能当作未接受把文字还给输入框,
+          // 否则用户再发一次会换新的 request_id,可能重复执行
+          if (e.retryRejected) {
+            uncertain = true
+            throw new Error('无法确认消息是否已发送,请稍后刷新会话查看,确认后再重发')
+          }
+          throw e
+        }
         promptId = ['preparing', 'running', 'finalizing'].includes(recorded.status) ? recorded.id : null
       }
       accepted = true
@@ -650,7 +674,7 @@ export const useChatStore = defineStore('chat', () => {
       live.status = 'error'
       live.errorText = errMsg(e)
       // 服务端没有接受请求(被限流、有任务在跑、回退被拒绝等),对话没有变化,恢复原样
-      if (!accepted && sid === sessionId.value) messages.value = snapshot
+      if (!accepted && !uncertain && sid === sessionId.value) messages.value = snapshot
     } finally {
       await finish(sid, mine, live, accepted)
     }
@@ -661,7 +685,8 @@ export const useChatStore = defineStore('chat', () => {
         // 重新打开会话即可看到
       }
     }
-    return accepted
+    // 结果未知时也算"已交出":调用方不把文字还回输入框,避免换个 request_id 重发
+    return accepted || uncertain
   }
 
   /** 编辑某条用户消息后重发(丢弃它之后的全部对话)。 */
