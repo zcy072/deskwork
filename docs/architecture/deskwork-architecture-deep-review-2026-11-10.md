@@ -175,6 +175,8 @@ R10～R16 已修复，正式回归测试见：
 - R16：`test_tool_error_feedback.py`
 
 已知限制：
-- R12 未在真实 Docker 实例里复现残留进程，验证基于受控替身。停止未确认时会话一直停在 recovery_required，要重启服务才能恢复。
+- R12 单元验证基于受控替身。部署后在真实 manager/Docker 上跑了 `make sandbox-verify`：取消、超时、重复取消都拿到 `stopped` 回执并恢复，测试进程无残留；
+  主动断开 WebSocket（无回执）时会话被挡住、抛 `SandboxStopUnconfirmed`，符合契约（原脚本假设断连后静默重连，已按新契约改写）。
+  manager 自身 pkill/pgrep 失败的路径未在真实环境注入。停止未确认时会话一直停在 recovery_required，要重启服务才能恢复。
 - R13 只对新记录了 `answered_interrupt` 的 Run 生效。修复前的旧 Run 回退时，仍会清空同一暂停点的全部答案。
 - 嵌套子图中的并行确认没有单独补测试。

@@ -1,0 +1,206 @@
+{'host_read': 'OUTSIDE_SESSION_SENTINEL', 'ancestor_swapped': True}
+F{'outside_bytes': 'delivery bytes', 'output_is_symlink': True}
+F[32m[2026-11-10 15:23:28,903] | trace=- | session=- | INFO  | app.utils:208 | Session s cancelled, killing sandbox shell[0m
+{'workspace_lock_held': False, 'process_still_alive_at_release': True}
+F{'termination_error': 'None', 'exit_ack_received': False, 'reported_returncode': -1}
+F[32m[2026-11-10 15:23:29,035] | trace=- | session=- | INFO  | app.utils:72 | Database ready: sqlite+aiosqlite:////tmp/pytest-of-zcy/pytest-59/test_run_retains_gate_when_rem0/data/deskwork.sqlite[0m
+[32m[2026-11-10 15:23:29,359] | trace=- | session=s | INFO  | app.utils:208 | Session s cancelled, killing sandbox shell[0m
+[31m[2026-11-10 15:23:29,360] | trace=- | session=s | ERROR | app.utils:116 | Error executing command
+Traceback (most recent call last):
+  File "./backend/app/sandbox/bash_handler.py", line 206, in _cleanup_on_cancel
+    yield
+  File "./backend/app/sandbox/bash_handler.py", line 131, in execute
+    output, timed_out, cwd = await self._read_until_sentinel(timeout_sec)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "./backend/app/sandbox/bash_handler.py", line 625, in _read_until_sentinel
+    label, line = await asyncio.wait_for(self._output_queue.get(), timeout=remaining)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/tasks.py", line 520, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/queues.py", line 158, in get
+    await getter
+asyncio.exceptions.CancelledError: <object object at 0x7267f84f8fd0>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "./backend/app/tools/file_tools.py", line 110, in bash_tool
+    feedback, is_error = await CONTAINER_MANAGER.bash_tool_helper(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/deskwork_deep_review_test.py", line 160, in bash_tool_helper
+    return await shell.execute(command, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "./backend/app/sandbox/bash_handler.py", line 113, in execute
+    async with self.workspace_lock, self._lock, self._cleanup_on_cancel():
+  File "/usr/lib/python3.12/contextlib.py", line 231, in __aexit__
+    await self.gen.athrow(value)
+  File "./backend/app/sandbox/bash_handler.py", line 209, in _cleanup_on_cancel
+    await asyncio.shield(self._stop())
+  File "./backend/app/sandbox/bash_handler.py", line 567, in _stop
+    await self.manager_client.terminate(self._process)
+  File "/tmp/deskwork_deep_review_test.py", line 154, in terminate
+    raise RuntimeError('stop not confirmed')
+RuntimeError: stop not confirmed[0m
+[32m[2026-11-10 15:23:29,370] | trace=- | session=s | INFO  | app.utils:115 | Repairing cancelled tool calls for session 's' with messages: 1[0m
+{'gate_retained': False, 'remote_process_alive': True}
+F[32m[2026-11-10 15:23:29,495] | trace=- | session=- | INFO  | app.utils:72 | Database ready: sqlite+aiosqlite:////tmp/pytest-of-zcy/pytest-59/test_rewind_second_parallel_an0/data/deskwork.sqlite[0m
+{'rewind_status': 'waiting', 'answers': {'c2': 'User answered: PDF'}, 'pending_questions': [{'question': '选择颜色', 'kind': 'single_select', 'options': ['红', '蓝']}]}
+F[32m[2026-11-10 15:23:29,944] | trace=- | session=- | INFO  | app.utils:72 | Database ready: sqlite+aiosqlite:////tmp/pytest-of-zcy/pytest-59/test_delegated_stream_does_not0/data/deskwork.sqlite[0m
+{'status': 'complete', 'visible_text': 'PUBLIC_FINAL_ANSWER'}
+.[32m[2026-11-10 15:23:30,226] | trace=- | session=- | INFO  | app.utils:72 | Database ready: sqlite+aiosqlite:////tmp/pytest-of-zcy/pytest-59/test_cancel_before_entry_final0/data/deskwork.sqlite[0m
+{'run_status': 'preparing', 'gate_still_held': True, 'worker_done': True, 'worker_entered': False}
+F{'command_result_after_deadline': ('', False, None)}
+F[31m[2026-11-10 15:23:30,270] | trace=- | session=- | ERROR | app.utils:62 | view_image failed: PRIVATE_INTERNAL_SENTINEL[0m
+{'tool': 'view_image', 'feedback': 'Error: PRIVATE_INTERNAL_SENTINEL'}
+F[31m[2026-11-10 15:23:30,278] | trace=- | session=- | ERROR | app.utils:49 | review_document failed: PRIVATE_INTERNAL_SENTINEL[0m
+{'tool': 'review_document', 'feedback': 'Error: PRIVATE_INTERNAL_SENTINEL\nThe automatic layout check is unavailable; continue without it and mention that the layout was not verified.'}
+F[31m[2026-11-10 15:23:30,285] | trace=- | session=- | ERROR | app.utils:56 | search_document failed: PRIVATE_INTERNAL_SENTINEL[0m
+{'tool': 'search_document', 'feedback': 'Error: PRIVATE_INTERNAL_SENTINEL'}
+F
+=================================== FAILURES ===================================
+________________ test_host_read_cannot_follow_replaced_ancestor ________________
+/tmp/deskwork_deep_review_test.py:43: in test_host_read_cannot_follow_replaced_ancestor
+    assert 'OUTSIDE_SESSION_SENTINEL' not in result
+E   AssertionError: assert 'OUTSIDE_SESSION_SENTINEL' not in 'OUTSIDE_SESSION_SENTINEL'
+E     
+E     'OUTSIDE_SESSION_SENTINEL' is contained here:
+E       OUTSIDE_SESSION_SENTINEL
+__________ test_atomic_delivery_cannot_reopen_replaced_temporary_file __________
+/tmp/deskwork_deep_review_test.py:65: in test_atomic_delivery_cannot_reopen_replaced_temporary_file
+    assert outside.read_text() == 'must be preserved'
+E   AssertionError: assert 'delivery bytes' == 'must be preserved'
+E     
+E     - must be preserved
+E     + delivery bytes
+____________ test_second_bash_cancel_keeps_lock_until_process_stops ____________
+/tmp/deskwork_deep_review_test.py:100: in test_second_bash_cancel_keeps_lock_until_process_stops
+    assert held or not alive
+E   assert (False or not True)
+------------------------------ Captured log call -------------------------------
+INFO     app.utils:bash_handler.py:208 Session s cancelled, killing sandbox shell
+___________ test_remote_termination_without_exit_ack_is_not_success ____________
+/tmp/deskwork_deep_review_test.py:131: in test_remote_termination_without_exit_ack_is_not_success
+    assert error is not None
+E   assert None is not None
+_______________ test_run_retains_gate_when_remote_cleanup_fails ________________
+/tmp/deskwork_deep_review_test.py:173: in test_run_retains_gate_when_remote_cleanup_fails
+    assert handle is not None and handle.phase == 'recovery_required'
+E   assert (None is not None)
+------------------------------ Captured log setup ------------------------------
+INFO     app.utils:__init__.py:72 Database ready: sqlite+aiosqlite:////tmp/pytest-of-zcy/pytest-59/test_run_retains_gate_when_rem0/data/deskwork.sqlite
+------------------------------ Captured log call -------------------------------
+INFO     app.utils:bash_handler.py:208 Session s cancelled, killing sandbox shell
+ERROR    app.utils:file_tools.py:116 Error executing command
+Traceback (most recent call last):
+  File "./backend/app/sandbox/bash_handler.py", line 206, in _cleanup_on_cancel
+    yield
+  File "./backend/app/sandbox/bash_handler.py", line 131, in execute
+    output, timed_out, cwd = await self._read_until_sentinel(timeout_sec)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "./backend/app/sandbox/bash_handler.py", line 625, in _read_until_sentinel
+    label, line = await asyncio.wait_for(self._output_queue.get(), timeout=remaining)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/tasks.py", line 520, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/queues.py", line 158, in get
+    await getter
+asyncio.exceptions.CancelledError: <object object at 0x7267f84f8fd0>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "./backend/app/tools/file_tools.py", line 110, in bash_tool
+    feedback, is_error = await CONTAINER_MANAGER.bash_tool_helper(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/deskwork_deep_review_test.py", line 160, in bash_tool_helper
+    return await shell.execute(command, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "./backend/app/sandbox/bash_handler.py", line 113, in execute
+    async with self.workspace_lock, self._lock, self._cleanup_on_cancel():
+  File "/usr/lib/python3.12/contextlib.py", line 231, in __aexit__
+    await self.gen.athrow(value)
+  File "./backend/app/sandbox/bash_handler.py", line 209, in _cleanup_on_cancel
+    await asyncio.shield(self._stop())
+  File "./backend/app/sandbox/bash_handler.py", line 567, in _stop
+    await self.manager_client.terminate(self._process)
+  File "/tmp/deskwork_deep_review_test.py", line 154, in terminate
+    raise RuntimeError('stop not confirmed')
+RuntimeError: stop not confirmed
+INFO     app.utils:recovery.py:115 Repairing cancelled tool calls for session 's' with messages: 1
+____________ test_rewind_second_parallel_answer_keeps_first_answer _____________
+/tmp/deskwork_deep_review_test.py:196: in test_rewind_second_parallel_answer_keeps_first_answer
+    assert changed.status == 'complete'
+E   AssertionError: assert 'waiting' == 'complete'
+E     
+E     - complete
+E     + waiting
+------------------------------ Captured log setup ------------------------------
+INFO     app.utils:__init__.py:72 Database ready: sqlite+aiosqlite:////tmp/pytest-of-zcy/pytest-59/test_rewind_second_parallel_an0/data/deskwork.sqlite
+_______ test_cancel_before_entry_finalization_survives_cancelled_waiter ________
+/tmp/deskwork_deep_review_test.py:261: in test_cancel_before_entry_finalization_survives_cancelled_waiter
+    assert stored.status == 'cancelled' and not stranded
+E   AssertionError: assert ('preparing' == 'cancelled'
+E     
+E     - cancelled
+E     + preparing)
+------------------------------ Captured log setup ------------------------------
+INFO     app.utils:__init__.py:72 Database ready: sqlite+aiosqlite:////tmp/pytest-of-zcy/pytest-59/test_cancel_before_entry_final0/data/deskwork.sqlite
+________ test_shell_deadline_crossed_before_queue_wait_is_still_timeout ________
+/tmp/deskwork_deep_review_test.py:271: in test_shell_deadline_crossed_before_queue_wait_is_still_timeout
+    assert result[1] is True
+E   assert False is True
+_____ test_unknown_tool_errors_do_not_expose_internal_details[view_image] ______
+/tmp/deskwork_deep_review_test.py:294: in test_unknown_tool_errors_do_not_expose_internal_details
+    assert marker not in feedback
+E   AssertionError: assert 'PRIVATE_INTERNAL_SENTINEL' not in 'Error: PRIV...NAL_SENTINEL'
+E     
+E     'PRIVATE_INTERNAL_SENTINEL' is contained here:
+E       Error: PRIVATE_INTERNAL_SENTINEL
+------------------------------ Captured log call -------------------------------
+ERROR    app.utils:image_tools.py:62 view_image failed: PRIVATE_INTERNAL_SENTINEL
+___ test_unknown_tool_errors_do_not_expose_internal_details[review_document] ___
+/tmp/deskwork_deep_review_test.py:294: in test_unknown_tool_errors_do_not_expose_internal_details
+    assert marker not in feedback
+E   AssertionError: assert 'PRIVATE_INTERNAL_SENTINEL' not in 'Error: PRIV...ot verified.'
+E     
+E     'PRIVATE_INTERNAL_SENTINEL' is contained here:
+E       Error: PRIVATE_INTERNAL_SENTINEL
+E       The automatic layout check is unavailable; continue without it and mention that the layout was not verified.
+------------------------------ Captured log call -------------------------------
+ERROR    app.utils:review_tools.py:49 review_document failed: PRIVATE_INTERNAL_SENTINEL
+___ test_unknown_tool_errors_do_not_expose_internal_details[search_document] ___
+/tmp/deskwork_deep_review_test.py:294: in test_unknown_tool_errors_do_not_expose_internal_details
+    assert marker not in feedback
+E   AssertionError: assert 'PRIVATE_INTERNAL_SENTINEL' not in 'Error: PRIV...NAL_SENTINEL'
+E     
+E     'PRIVATE_INTERNAL_SENTINEL' is contained here:
+E       Error: PRIVATE_INTERNAL_SENTINEL
+------------------------------ Captured log call -------------------------------
+ERROR    app.utils:search_tools.py:56 search_document failed: PRIVATE_INTERNAL_SENTINEL
+=============================== warnings summary ===============================
+::test_run_retains_gate_when_remote_cleanup_fails
+  ./backend/.venv/lib/python3.12/site-packages/pydantic/functional_validators.py:835: UserWarning: Pydantic serializer warnings:
+    PydanticSerializationUnexpectedValue(Expected `none` - serialized value may not be as expected [field_name='context', input_value=RunContext(session_id='s'... workspace_mode='write'), input_type=RunContext])
+    function=lambda v, h: h(v), schema=original_schema
+
+::test_run_retains_gate_when_remote_cleanup_fails
+  ./backend/.venv/lib/python3.12/site-packages/pydantic/main.py:475: UserWarning: Pydantic serializer warnings:
+    PydanticSerializationUnexpectedValue(Expected `none` - serialized value may not be as expected [field_name='context', input_value=RunContext(session_id='s'... workspace_mode='write'), input_type=RunContext])
+    return self.__pydantic_serializer__.to_python(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ::test_host_read_cannot_follow_replaced_ancestor - AssertionError: ass...
+FAILED ::test_atomic_delivery_cannot_reopen_replaced_temporary_file - Asserti...
+FAILED ::test_second_bash_cancel_keeps_lock_until_process_stops - assert (Fal...
+FAILED ::test_remote_termination_without_exit_ack_is_not_success - assert Non...
+FAILED ::test_run_retains_gate_when_remote_cleanup_fails - assert (None is no...
+FAILED ::test_rewind_second_parallel_answer_keeps_first_answer - AssertionErr...
+FAILED ::test_cancel_before_entry_finalization_survives_cancelled_waiter - As...
+FAILED ::test_shell_deadline_crossed_before_queue_wait_is_still_timeout - ass...
+FAILED ::test_unknown_tool_errors_do_not_expose_internal_details[view_image]
+FAILED ::test_unknown_tool_errors_do_not_expose_internal_details[review_document]
+FAILED ::test_unknown_tool_errors_do_not_expose_internal_details[search_document]
+11 failed, 1 passed, 2 warnings in 5.08s

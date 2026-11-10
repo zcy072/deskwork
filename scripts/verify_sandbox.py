@@ -10,6 +10,7 @@ import uuid
 
 from app.config import settings
 from app.sandbox.bash_handler import BashSessionsManager
+from app.sandbox.errors import SandboxStopUnconfirmed
 
 
 async def main():
@@ -57,12 +58,19 @@ async def main():
         results["busy_not_reaped_cancel_closes"] = True
         out, err = await s.execute("echo recovered")
         assert not err and "recovered" in out
+        # 连接断开而没有结束回执:无法确认进程已停,会话应被挡住而不是悄悄重连(R12)
         await s._process._ws.close()
         await asyncio.sleep(1)
         assert not s.shell_alive
-        out, err = await s.execute("echo reconnected")
-        assert not err and "reconnected" in out
-        results["disconnect_reconnect"] = True
+        try:
+            await s.execute("echo reconnected")
+        except SandboxStopUnconfirmed:
+            pass
+        else:
+            raise AssertionError("disconnect without receipt must block the session")
+        assert s.stop_state.unconfirmed
+        results["disconnect_blocks_session"] = True
+        s = await mgr.get_or_create(ids[1])
         out, err = await s.execute("sleep 5", timeout=1)
         assert err and "timed out" in out
         out, err = await s.execute("echo after_timeout")
