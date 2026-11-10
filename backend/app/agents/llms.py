@@ -115,6 +115,7 @@ def build_model(profile: LLMProfile | None = None) -> BaseChatModel:
             base_url=base_url,
             model=profile.model,
             temperature=settings.LLM_TEMPERATURE,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     if provider == "anthropic":
@@ -130,6 +131,7 @@ def build_model(profile: LLMProfile | None = None) -> BaseChatModel:
             base_url=base_url,
             model=profile.model,
             max_tokens=settings.LLM_MAX_TOKENS,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
             **kwargs,
         )
 
@@ -142,6 +144,7 @@ def build_model(profile: LLMProfile | None = None) -> BaseChatModel:
             api_version=settings.LLM_API_VERSION,
             model=profile.model,
             temperature=settings.LLM_TEMPERATURE,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     raise ValueError(

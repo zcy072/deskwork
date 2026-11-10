@@ -6,7 +6,17 @@ assistant 消息的 parts 按时间顺序保存 text / tool_call / tool_result /
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -16,6 +26,11 @@ def _now() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+class SchemaRevision(Base):
+    __tablename__ = "schema_revisions"
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
 
 
 class Conversation(Base):
@@ -32,6 +47,8 @@ class Conversation(Base):
     last_run_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # 该终态用户还没看过;NULL(旧数据)按已读处理
     unread: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    graph_thread_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    graph_checkpoint_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     messages: Mapped[list["Message"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan", order_by="Message.id"
@@ -59,9 +76,38 @@ class Message(Base):
     checkpoint_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 仅 assistant 消息使用:这一轮的 usage 事件(token、by_model)。NULL 表示未记录
     usage: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_event_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class Run(Base):
+    """Durable execution facts; asyncio tasks and transport status are not persisted here."""
+
+    __tablename__ = "runs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    client_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    turn_id: Mapped[str] = mapped_column(String(64))
+    resume_of_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    input_committed: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(16), default="preparing")
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    public_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(64), default="")
+    usage: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "client_request_id", name="uq_run_request"),
+        Index("ix_runs_latest", "conversation_id", "created_at", "id"),
+    )
 
 
 class UploadedFile(Base):

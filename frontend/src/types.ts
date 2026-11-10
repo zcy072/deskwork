@@ -40,12 +40,14 @@ export type Part =
   | { type: 'files'; files: FileRef[] }
   | { type: 'widgets'; widgets: Widget[] }
   | { type: 'sources'; sources: SourceRef[] }
-  | { type: 'ask'; question: string; kind: 'single_select' | 'multi_select' | 'free_text'; options: string[] }
+  | { type: 'ask'; question: string; kind: 'single_select' | 'multi_select' | 'free_text'; options: string[]; interrupt_id?: string }
 
 export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
   parts: Part[]
+  runId?: string
+  lastEventSeq?: number
   status?: string
   /** status 为 error 时的错误信息 */
   errorText?: string
@@ -63,6 +65,9 @@ export interface ChatMessage {
 
 export interface MessageRow {
   id: number
+  prompt_id?: string
+  last_event_seq?: number
+  error_text?: string | null
   role: 'user' | 'assistant'
   parts: Part[]
   status: string
@@ -95,8 +100,22 @@ export interface SearchHit {
 
 export interface StreamPacket {
   id?: string
+  run_id?: string
+  seq?: number
+  schema_version?: number
   event: string
   data: Record<string, any>
+}
+
+export interface SavedRun {
+  id: string
+  session_id: string
+  status: RunStatus | 'preparing' | 'finalizing'
+  parts: Part[]
+  last_event_seq: number
+  error_code?: string | null
+  message?: string | null
+  input?: { text: string; files: FileRef[] }
 }
 
 export interface ConversationUsage {

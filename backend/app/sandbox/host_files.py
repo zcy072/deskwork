@@ -5,8 +5,10 @@
 """
 
 import os
+import secrets
 import stat
 import time
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from app.sandbox.errors import ContainerFileSystemError
@@ -16,9 +18,30 @@ from app.sandbox.quota import MB
 MAX_READ_BYTES = 50 * 1024 * 1024
 
 
-def read_regular_file(host: Path) -> bytes:
+@contextmanager
+def parent_fd(root: Path, host: Path, *, create: bool = False):
+    """Walk from a trusted root without following any mutable directory symlink."""
+    relative = host.relative_to(root.resolve())
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("Invalid file path")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        fd = os.open(host, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        for part in relative.parts[:-1]:
+            if create:
+                with suppress(FileExistsError):
+                    os.mkdir(part, 0o777, dir_fd=fd)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd, relative.name
+    finally:
+        os.close(fd)
+
+
+def read_regular_file(host: Path, root: Path | None = None) -> bytes:
+    try:
+        with parent_fd(root or host.parent, host) as (directory, name):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     except OSError as exc:
         raise ContainerFileSystemError(f"Failed to read file: {exc.strerror}") from exc
     with os.fdopen(fd, "rb") as fh:
@@ -54,25 +77,38 @@ def list_dir(host: Path) -> str:
     return "\n".join(lines) or "(empty directory)"
 
 
-def write_file(host_path: Path, data: bytes, mkdir_parents: bool) -> None:
+def write_file(host_path: Path, data: bytes, mkdir_parents: bool, root: Path | None = None) -> None:
     """覆盖写入;新建的文件和目录放宽权限,agent 用户才能继续改。"""
     try:
-        if mkdir_parents:
-            missing = []
-            parent = host_path.parent
-            while not parent.exists():
-                missing.append(parent)
-                parent = parent.parent
-            host_path.parent.mkdir(parents=True, exist_ok=True)
-            for d in missing:  # agent 用户需要能在新目录里继续写
-                d.chmod(0o777)
-        existed = host_path.exists()
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-        fd = os.open(host_path, flags, 0o666)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        if not existed:
-            host_path.chmod(0o666)
+        with parent_fd(root or host_path.parent, host_path, create=mkdir_parents) as (
+            directory,
+            name,
+        ):
+            mode = 0o666
+            try:
+                current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISREG(current.st_mode):
+                    raise ContainerFileSystemError("Not a regular file")
+                mode = stat.S_IMODE(current.st_mode)
+            except FileNotFoundError:
+                pass
+            temporary = f".write-{secrets.token_hex(12)}"
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                mode,
+                dir_fd=directory,
+            )
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    os.fchmod(fh.fileno(), mode)
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+            finally:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary, dir_fd=directory)
     except OSError as exc:
         raise ContainerFileSystemError(f"Failed to write file: {exc}") from exc
 

@@ -22,7 +22,7 @@ export type Item =
   | Step
   | { kind: 'files'; files: FileRef[] }
   | { kind: 'widgets'; widgets: Widget[] }
-  | { kind: 'ask'; question: string; askKind: AskPart['kind']; options: string[] }
+  | { kind: 'ask'; question: string; askKind: AskPart['kind']; options: string[]; interruptId?: string }
 
 /** 把 tool_call 与同 id 的 tool_result 配成一个步骤,其余 part 原样保留。 */
 export function groupParts(parts: Part[]): Item[] {
@@ -42,7 +42,7 @@ export function groupParts(parts: Part[]): Item[] {
       else items.push({ kind: 'step', id: p.id ?? null, name: p.name ?? '未知工具', args: null, result: p })
     } else if (p.type === 'files') items.push({ kind: 'files', files: p.files })
     else if (p.type === 'widgets') items.push({ kind: 'widgets', widgets: p.widgets })
-    else if (p.type === 'ask') items.push({ kind: 'ask', question: p.question, askKind: p.kind, options: p.options })
+    else if (p.type === 'ask') items.push({ kind: 'ask', question: p.question, askKind: p.kind, options: p.options, ...(p.interrupt_id ? { interruptId: p.interrupt_id } : {}) })
   }
   return items
 }

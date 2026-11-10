@@ -1,5 +1,6 @@
 """executor 的文件读写逻辑:用内存假会话覆盖 str_replace / insert / view 的边界。"""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from app.tools.executor import (
 
 class FakeSession:
     def __init__(self, files: dict[str, str]) -> None:
+        self.workspace_lock = asyncio.Lock()
         self.files = files
         self.paths = SimpleNamespace(
             virtual_root="/workspace",

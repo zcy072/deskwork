@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from app.config import settings
+from app.runtime.sessions import complete_before_cancelling, file_io
 from app.sandbox import bwrap, host_files
 from app.sandbox.command_validator import CommandValidator
 from app.sandbox.constants import (
@@ -73,12 +74,15 @@ class BashSession:
         container_name: str = CONTAINER_NAME,
         validator: CommandValidator | None = None,
         manager_client: ManagerClient | None = None,
+        readonly: bool = False,
     ) -> None:
         self.paths = paths
+        self.readonly = readonly
         self.container_name = container_name
         self.validator = validator or CommandValidator()
         self.manager_client = manager_client or ManagerClient()
         self._lock = asyncio.Lock()
+        self.workspace_lock = asyncio.Lock()
         self._process: RemoteProcess | None = None
         # (label, 行);行为 None 表示该流的读取已结束(EOF 或超出输出上限),用来唤醒等待方
         self._output_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
@@ -106,7 +110,7 @@ class BashSession:
         started = time.monotonic()
         command_digest = hashlib.sha256(command.encode()).hexdigest()[:12]
 
-        async with self._lock, self._cleanup_on_cancel():
+        async with self.workspace_lock, self._lock, self._cleanup_on_cancel():
             self.last_used = time.monotonic()
             # 校验依赖当前 cwd,必须在拿到锁之后:排队期间前一条命令可能已经 cd 走了
             ok, reason = self.validate_command(command)
@@ -214,7 +218,7 @@ class BashSession:
         now = time.monotonic()
         if reuse and self._usage and now - self._usage[0] < USAGE_CACHE_SEC:
             return self._usage[1]
-        used = await asyncio.to_thread(session_usage, self.paths.session_root)
+        used = await file_io(session_usage, self.paths.session_root)
         self._usage = (now, used)
         return used
 
@@ -225,6 +229,16 @@ class BashSession:
             await self._ensure_started()
             return "Bash session restarted"
 
+    async def execute_readonly(self, command: str, timeout: int) -> tuple[str, bool]:
+        child = BashSession(
+            self.paths, self.container_name, self.validator, self.manager_client, readonly=True
+        )
+        child.workspace_lock = self.workspace_lock
+        try:
+            return await child.execute(command, timeout)
+        finally:
+            await asyncio.shield(child.close())
+
     async def save_upload(self, dest_name: str, data: bytes) -> Path:
         """把上传内容直接写进 uploads(调用方已保证文件名唯一)。
 
@@ -233,7 +247,7 @@ class BashSession:
         if ".." in Path(dest_name).parts or Path(dest_name).is_absolute():
             raise ValueError("Invalid destination filename")
         host_dest = self.paths.uploads / dest_name
-        await asyncio.to_thread(host_files.create_upload, host_dest, data)
+        await file_io(host_files.create_upload, host_dest, data)
         return host_dest
 
     async def close(self) -> None:
@@ -287,23 +301,21 @@ class BashSession:
             raise ContainerFileSystemError(str(exc)) from exc
 
     async def path_exists(self, container_path: str) -> bool:
-        return await asyncio.to_thread(lambda: self._host_path(container_path).exists())
+        return await file_io(lambda: self._host_path(container_path).exists())
 
     async def is_directory(self, container_path: str) -> bool:
-        return await asyncio.to_thread(lambda: self._host_path(container_path).is_dir())
+        return await file_io(lambda: self._host_path(container_path).is_dir())
 
     async def is_file(self, container_path: str) -> bool:
-        return await asyncio.to_thread(lambda: self._host_path(container_path).is_file())
+        return await file_io(lambda: self._host_path(container_path).is_file())
 
     async def read_container_file(self, container_path: str, *, strict: bool = False) -> str:
         """strict=True 时非 UTF-8 内容抛 UnicodeDecodeError,供要写回的编辑操作使用。"""
-        data = await asyncio.to_thread(
-            lambda: host_files.read_regular_file(self._host_path(container_path))
-        )
+        data = await file_io(lambda: host_files.read_regular_file(self._host_path(container_path)))
         return data.decode("utf-8", errors="strict" if strict else "replace")
 
     async def list_directory(self, container_path: str) -> str:
-        return await asyncio.to_thread(lambda: host_files.list_dir(self._host_path(container_path)))
+        return await file_io(lambda: host_files.list_dir(self._host_path(container_path)))
 
     async def copy_to_host(self, container_path: str, host_dest: Path) -> None:
         """经 sandbox-manager 读出容器内文件写到 host_dest;宿主侧读不到源文件时的兜底。"""
@@ -368,7 +380,9 @@ class BashSession:
                 f"Path '{container_path}' is not in a writable directory"
             )
         data = content.encode("utf-8")
-        await asyncio.to_thread(host_files.write_file, host_path, data, mkdir_parents)
+        await file_io(
+            host_files.write_file, host_path, data, mkdir_parents, self.paths.session_root
+        )
 
     # ── 回退快照 ──
 
@@ -377,27 +391,30 @@ class BashSession:
 
         由容器内的 agent 用户复制,scratchpad 下的转换中间目录不复制。内容与最新一份快照相同时
         只建硬链接副本。合计超过 SNAPSHOT_MAX_MB 就跳过,只保留最近 SNAPSHOT_KEEP 份。
-        不持会话锁:每轮开始前调用,此时本会话还没有命令在跑。
+        持工作区锁直到远程复制结束,取消等待者也不能提前放行写入。
         """
         if not settings.SNAPSHOT_KEEP:
             return False
-        sid = self.paths.session_id
-        size, fingerprint = await asyncio.to_thread(snapshot_manifest, self.paths.session_root)
-        if size > settings.SNAPSHOT_MAX_MB * MB:
-            logger.info("Session %s too large to snapshot (%d MB)", sid, size // MB)
-            return False
-        script = snapshot_script(
-            self.paths.container_root, prompt_id, fingerprint, settings.SNAPSHOT_KEEP
-        )
-        try:
-            result = await self.manager_client.run_exec(self.container_name, script)
-        except Exception:
-            logger.exception("Snapshot of session %s failed", sid)
-            return False
-        if result.returncode != 0:
-            logger.warning("Snapshot of session %s failed: %s", sid, result.stderr.strip())
-            return False
-        return True
+        async with self.workspace_lock:
+            sid = self.paths.session_id
+            size, fingerprint = await file_io(snapshot_manifest, self.paths.session_root)
+            if size > settings.SNAPSHOT_MAX_MB * MB:
+                logger.info("Session %s too large to snapshot (%d MB)", sid, size // MB)
+                return False
+            script = snapshot_script(
+                self.paths.container_root, prompt_id, fingerprint, settings.SNAPSHOT_KEEP
+            )
+            try:
+                result = await complete_before_cancelling(
+                    asyncio.create_task(self.manager_client.run_exec(self.container_name, script))
+                )
+            except Exception:
+                logger.exception("Snapshot of session %s failed", sid)
+                return False
+            if result.returncode != 0:
+                logger.warning("Snapshot of session %s failed: %s", sid, result.stderr.strip())
+                return False
+            return True
 
     async def restore_snapshot(self, prompt_id: str) -> bool:
         """把 output / scratchpad 恢复成该轮开始前的样子,并丢弃这一轮及之后的快照。
@@ -406,11 +423,13 @@ class BashSession:
         """
         sid = self.paths.session_id
         script = restore_script(self.paths.container_root, prompt_id)
-        async with self._lock:
+        async with self.workspace_lock, self._lock:
             # 命令行里的工作目录可能在被清掉的子目录里,先关掉 shell,下次执行时会重新启动
             await self._stop()
             try:
-                result = await self.manager_client.run_exec(self.container_name, script)
+                result = await complete_before_cancelling(
+                    asyncio.create_task(self.manager_client.run_exec(self.container_name, script))
+                )
             except Exception:
                 logger.exception("Restoring snapshot of session %s failed", sid)
                 return False
@@ -426,12 +445,16 @@ class BashSession:
     async def run_isolated(
         self, command: str, timeout: int | None = COMMAND_TIMEOUT_SEC
     ) -> tuple[str, bool]:
-        """在一个独立的 bwrap 里跑一条命令,不占用会话 shell 的锁,可与 agent 的命令并行。
+        """在一个独立的 bwrap 里跑一条命令,通过工作区锁与文件变更互斥。
 
         隔离参数与会话 shell 相同(只挂载本会话目录,无网络);HOME 指向这次独有的 /tmp,
         所以 LibreOffice 之类带用户配置的程序不会和 agent shell 里的实例抢同一份配置。
         不经过命令校验和配额检查:只给后端自己拼的固定命令用,不要传入模型给的命令。
         """
+        async with self.workspace_lock:
+            return await self._run_isolated(command, timeout)
+
+    async def _run_isolated(self, command: str, timeout: int | None) -> tuple[str, bool]:
         argv = bwrap.oneshot_argv(self.paths, command)
         prefix = ""
         if settings.SESSION_MAX_FILE_MB:
@@ -439,8 +462,12 @@ class BashSession:
         # exec:让 bwrap 直接取代 sh,超时的 KILL 才会落在 bwrap 上(--die-with-parent 随之清掉子进程)
         script = f"{prefix}exec {shlex.join(argv)}"
         try:
-            result = await self.manager_client.run_exec(
-                self.container_name, script, timeout=cap_timeout(timeout)
+            result = await complete_before_cancelling(
+                asyncio.create_task(
+                    self.manager_client.run_exec(
+                        self.container_name, script, timeout=cap_timeout(timeout)
+                    )
+                )
             )
         except TimeoutError:
             return f"Error: timed out after {cap_timeout(timeout)} seconds", True
@@ -460,7 +487,7 @@ class BashSession:
         self._current_cwd = self.paths.virtual_scratchpad
         self._output_queue = asyncio.Queue()
         self._process = await self.manager_client.spawn(
-            self.container_name, bwrap.shell_argv(self.paths)
+            self.container_name, bwrap.shell_argv(self.paths, readonly=self.readonly)
         )
         self._start_readers()
         await asyncio.sleep(0.2)
@@ -747,6 +774,7 @@ class BashSessionsManager:
                 await session.close()
             except Exception:
                 logger.exception("Closing sandbox shell of %s failed", session.paths.session_id)
+        await self._manager_client.aclose()
 
     async def purge_session(self, session_id: str) -> None:
         """彻底删除一个会话的沙箱数据;即使进程重启后内存里已没有该会话也能工作。"""
@@ -755,7 +783,7 @@ class BashSessionsManager:
         if session is not None:
             await session.close()
         paths = SessionPaths.create(session_id, self.host_sessions_root)
-        await asyncio.to_thread(shutil.rmtree, paths.session_root, True)
+        await file_io(shutil.rmtree, paths.session_root, True)
         # 宿主侧删不干净(文件属主不一致等)时,再让 manager 以 root 清一遍
         if paths.session_root.exists():
             await self._manager_client.remove_session(self.container_name, paths.container_root)

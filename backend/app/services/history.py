@@ -18,6 +18,7 @@ class TurnRecorder:
         self.parts: list[dict] = []
         self.message_id: int | None = None  # 首次落库后记下行 id,之后按主键更新
         self.last_write: float = 0.0  # 上次落库的 monotonic 时间,用于合并 running 快照
+        self.streamed_text = False
 
     def record(self, event: str, data: dict) -> None:
         if event == "ai.token":
@@ -28,8 +29,9 @@ class TurnRecorder:
                 self.parts[-1]["text"] += text
             else:
                 self.parts.append({"type": "text", "text": text})
+            self.streamed_text = True
         elif event == "ai.tool_call":
-            if data.get("text"):
+            if data.get("text") and not self.streamed_text:
                 self.record("ai.token", {"text": data["text"]})
             for call in data.get("tool_calls", []):
                 self.parts.append(
@@ -40,6 +42,7 @@ class TurnRecorder:
                         "args": call.get("args"),
                     }
                 )
+            self.streamed_text = False
         elif event == "tool.result":
             self.parts.append({"type": "tool_result", **data})
         elif event == "files.presented":

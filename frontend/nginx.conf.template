@@ -40,7 +40,7 @@ server {
     }
 
     # 后端接口:同源代理,API_KEY 非空时给没带 Key 的请求注入默认身份(单用户部署);多用户部署留空,每人在页面里填自己的 Key
-    location ~ ^/(send-message|stream-events|thread-status|thread-cancel|files|conversations|memories|capabilities|health)(/|$) {
+    location ~ ^/(send-message|stream-events|thread-status|thread-cancel|runs|files|conversations|memories|capabilities|health)(/|$) {
         proxy_pass http://backend:5001;
         proxy_http_version 1.1;
         proxy_set_header Host $host;

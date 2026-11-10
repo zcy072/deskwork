@@ -29,6 +29,7 @@ def test_accumulates_and_dedups_by_message_id():
         "cache_read_tokens": 40,
         "models": [],
         "by_model": {"unknown": {"input_tokens": 300, "output_tokens": 30}},
+        "missing_usage_calls": 0,
     }
 
 
@@ -51,10 +52,22 @@ def test_by_model_splits_tokens_per_model():
     }
 
 
-def test_missing_usage_is_ignored():
+def test_missing_usage_still_counts_model_calls():
     t = UsageTracker()
     t.add(SimpleNamespace(id="x", usage_metadata=None))
-    assert t.to_event()["llm_calls"] == 0
+    t.add(SimpleNamespace(id="x", usage_metadata=None))
+    assert t.to_event()["llm_calls"] == 1
+    assert t.to_event()["missing_usage_calls"] == 1
+
+
+def test_usage_arriving_after_response_is_counted_once():
+    t = UsageTracker()
+    t.add(SimpleNamespace(id="x", usage_metadata=None))
+    t.add(_msg("x", 4, 2))
+    t.add(_msg("x", 4, 2))
+    assert t.to_event()["llm_calls"] == 1
+    assert t.to_event()["total_tokens"] == 6
+    assert t.to_event()["missing_usage_calls"] == 0
 
 
 def test_recorder_ignores_usage_event():

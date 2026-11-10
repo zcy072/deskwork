@@ -19,6 +19,9 @@ class FakeProcess:
 
 
 class FakeClient:
+    async def aclose(self):
+        pass
+
     """write_stdin 按 reply 生成输出;reply 拿到包装脚本,可以取出本条命令的结束标记。"""
 
     def __init__(self) -> None:

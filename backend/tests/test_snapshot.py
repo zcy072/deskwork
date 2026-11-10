@@ -92,6 +92,17 @@ async def test_snapshot_script_embeds_current_fingerprint(manager, monkeypatch):
     assert fingerprint in manager._manager_client.scripts[-1]
 
 
+async def test_equal_size_rewrite_with_preserved_mtime_changes_snapshot(manager):
+    session = await manager.get_or_create("same-time")
+    target = session.paths.output / "data.txt"
+    target.write_text("aaaa")
+    before = target.stat()
+    original = snapshot_manifest(session.paths.session_root)
+    target.write_text("bbbb")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert snapshot_manifest(session.paths.session_root) != original
+
+
 async def test_snapshot_disabled_when_keep_is_zero(manager, monkeypatch):
     monkeypatch.setattr(settings, "SNAPSHOT_KEEP", 0)
     assert await manager.snapshot_session("s1", PID) is False

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import NotRequired
 
 from langchain.agents import create_agent
@@ -8,11 +9,13 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command
 from typing_extensions import TypedDict
 
+from app.agents.context import RunContext
 from app.agents.middlewares import ToolGuardMiddleware
 from app.agents.prompts import TASK_DESCRIPTION_PREFIX
 from app.config import settings
+from app.services.budget import BudgetExceeded
 from app.services.image_view import message_text
-from app.utils import logger
+from app.utils import get_trace_id, logger
 
 
 class SubAgent(TypedDict):
@@ -40,6 +43,7 @@ def create_task_tool(tools, subagents: list[SubAgent], model, state_schema):
             system_prompt=_agent["system_prompt"],
             tools=_tools,
             state_schema=state_schema,
+            context_schema=RunContext,
             middleware=[
                 ToolGuardMiddleware(emit_events=False),
                 # 子 Agent 的调用不会出现在主 Agent 的流事件里,BudgetGuard 看不到它,
@@ -62,7 +66,7 @@ def create_task_tool(tools, subagents: list[SubAgent], model, state_schema):
     async def task(
         description: str,
         subagent_type: str,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[RunContext],
     ):
         """Delegate a task to a specialized sub-agent with isolated context."""
         call_id = runtime.tool_call_id
@@ -81,13 +85,22 @@ def create_task_tool(tools, subagents: list[SubAgent], model, state_schema):
         try:
             # 只传任务描述:父 Agent 的 todos 等状态不属于子 Agent
             result = await agents[subagent_type].ainvoke(
-                {"messages": [{"role": "user", "content": description}]}
+                {"messages": [{"role": "user", "content": description}]},
+                context=(
+                    replace(runtime.context, workspace_mode="read")
+                    if isinstance(runtime.context, RunContext)
+                    else None
+                ),
             )
+        except BudgetExceeded:
+            raise
         except GraphBubbleUp:
             raise
-        except Exception as exc:
+        except Exception:
             logger.exception("Sub-agent %s failed", subagent_type)
-            return reply(f"Error: sub-agent {subagent_type} failed: {exc}", error=True)
+            return reply(
+                f"Error: sub-agent {subagent_type} failed (trace id: {get_trace_id()})", error=True
+            )
 
         text = message_text(result["messages"][-1].content)
         if not text:

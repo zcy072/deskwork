@@ -23,10 +23,9 @@ async def client(monkeypatch):
 
 def _status(monkeypatch, value, prompt_id=None):
     async def get_status(session_id):
-        return value
+        return value, prompt_id if value == "running" else None
 
-    monkeypatch.setattr(stream, "get_thread_status", get_status)
-    monkeypatch.setattr(stream, "get_active_prompt_id", lambda session_id: prompt_id)
+    monkeypatch.setattr(stream, "get_run_status", get_status)
 
 
 async def test_running_returns_prompt_id(client, monkeypatch):

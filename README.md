@@ -53,7 +53,7 @@ Deskwork 是一个类似 Claude 文件助手的 Agent 运行时。用户在对�
 ### 会话与文件
 
 - **流式响应**:Redis Streams 承载事件,SSE 按最后事件 ID 续流;切换会话后后台继续运行,回来可接回。
-- **编辑重发 / 重新生成**:回退 LangGraph checkpoint,同时从每轮快照恢复 `output/` 和 `scratchpad/`。
+- **编辑重发 / 重新生成**:选择历史 checkpoint,通过暂存目录与恢复记录恢复 `output/` 和 `scratchpad/`;快照不可用时明确选择仅回退对话。
 - **交付版本**:每个交付文件保留 1 份当前副本和最多 5 个历史版本,可在界面查看文本差异。
 - **交付前校验**:检查空文件、Office 文件结构、PDF 文件头、JSON 与 CSV 能否解析。
 - **预览**:Office 文件在沙箱里转成 PDF 预览;支持拖拽和粘贴上传。
@@ -66,7 +66,7 @@ Deskwork 是一个类似 Claude 文件助手的 Agent 运行时。用户在对�
 - 每轮预算保护:限制模型调用次数、token 数和重复的工具调用。
 - 多模型:OpenAI、Anthropic、DeepSeek、Ollama、vLLM、Azure,支持命名配置和失败自动回退。
 - `evals/` 评测框架:驱动真实 HTTP API,结合规则检查和 LLM 评审。
-- 后端 pytest 套件、前端 vitest,`make check` 一键执行 lint、测试与构建。
+- 后端 pytest 套件、前端 vitest;`make check` 执行静态检查、前端测试与构建,后端全量测试运行 `make backend-test`。
 
 ## 系统架构
 
@@ -86,7 +86,8 @@ flowchart LR
 | --- | --- |
 | 前端 | Vue 3 + TypeScript + Pinia + Naive UI,由 nginx 托管。nginx 同源代理 API 并注入 API Key,Key 不会进入浏览器 bundle |
 | 后端 | FastAPI,负责会话、文件、SSE 事件流和 Agent 调度 |
-| 事件总线 | Redis 保存流式事件、prompt 注册和线程状态,API 与 Agent 任务解耦 |
+| 事件流 | Redis 保存短期可续读事件;运行状态、请求幂等与归属由 SQLite Run 记录维护 |
+| 运行协调 | SessionRegistry 统一运行、清理与导出的会话占用;完成、失败、取消走同一收尾流程 |
 | Agent 运行时 | LangGraph / LangChain,带摘要、技能、工具守卫、记忆、模型回退和 prompt caching 中间件 |
 | 沙箱 | 只有 `sandbox-manager` 挂载 Docker 套接字,后端经它的固定接口操作沙箱容器 |
 
@@ -100,6 +101,7 @@ flowchart LR
 | `/workspace/skills` | `sandbox_data/default_skills` | 共享只读技能库 |
 
 更完整的设计取舍和长期约束见 [设计说明](docs/DESIGN_NOTES.md)。
+本次架构改进、关键代码、验证结果、部署状态及 AI 审查重点统一见 [重构审查交接文档](docs/architecture/deskwork-architecture-refactor.md)。
 
 ## 技术栈
 
@@ -172,6 +174,7 @@ docker compose up --build
 | `LLM_<NAME>_*` | 命名模型配置,如 `LLM_DEEPSEEK_API_KEY`、`LLM_DEEPSEEK_MODEL_NAME` |
 | `LLM_PROFILE` / `LLM_FALLBACKS` | 选择主模型配置,以及主模型失败时依次切换的备用配置 |
 | `LLM_MAX_TOKENS` | Anthropic 协议模型的单次回复输出上限,默认 `8192` |
+| `LLM_REQUEST_TIMEOUT_SECONDS` / `AGENT_RUN_TIMEOUT_SECONDS` | 模型 HTTP 请求超时默认 180 秒;执行片段总时限默认 1800 秒,后者设为 `0` 可关闭 |
 | `MEMORY_ENABLED` / `MEMORY_*` | 长期记忆开关、默认保留天数、最大条数、写入是否需确认 |
 | `MCP_SERVERS` / `MCP_CONFIRM_TOOLS` | 外部 MCP 服务(stdio / http / sse)的 JSON 配置,以及是否需要确认工具调用 |
 | `WEB_TOOLS_API_KEY` / `WEB_*` | 启用 `web_search` / `web_fetch`。按成功请求计费,查询和 URL 会发送给 DeepSeek |
@@ -192,6 +195,8 @@ docker compose up --build
 | `GET` | `/files/download` | 下载 `uploads/` 或 `output/` 里的会话文件 |
 | `GET` | `/conversations` | 会话列表 |
 | `GET` | `/conversations/{id}/messages` | 消息历史 |
+| `GET` | `/runs/{run_id}` | 持久运行状态、错误与已保存的展示快照 |
+| `GET` | `/conversations/{id}/requests/{request_id}` | 响应丢失后按原请求 ID 查询已接受的 Run |
 | `PATCH` | `/conversations/{id}` | 重命名会话 |
 | `DELETE` | `/conversations/{id}` | 删除会话及其文件 |
 
@@ -259,7 +264,7 @@ make sandbox-verify # 验证沙箱隔离
 - **危险命令确认基于黑名单**:检查命令位置上的词,并递归 `bash -c`、`eval`、包装命令和命令替换。藏在脚本文件里或由变量拼出的删除操作可能漏过。它是启发式过滤,不是隔离边界。
 - **语义检索可选**:默认只有 BM25。启用向量检索会把文档片段发给 embedding 服务,超过 `EMBEDDING_MAX_CHUNKS` 的文档退回 BM25。
 - **分支不可浏览**:编辑重发会回退对话,被放弃的分支留在 checkpoint 里,但界面不能切换过去。文件回退依赖每轮快照,快照受数量和大小限制。
-- **单进程**:运行中的任务、取消和启动恢复都在进程内存里,后端只能部署一个实例,重启后不会续跑原任务。
+- **单进程**:Run 状态持久化,任务与取消句柄保留在进程内存,后端只能部署一个实例。重启后标记中断并保留已有历史,不会自动重放原脚本。
 - **用户即 API Key**:没有账号和密码体系,换 Key 就换身份,原数据不再可见。
 - **配额按会话计算**:存储和单文件大小按会话限制,`MAX_CONCURRENT_RUNS` 限制全局并发运行数,CPU 和内存限制作用于整个沙箱容器。
 - **依赖与网络受限**:运行时安装新库和任意联网都被有意禁止。

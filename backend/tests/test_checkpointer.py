@@ -1,7 +1,6 @@
 """SQLite checkpointer:落盘、重启后可读回、未初始化时退回内存。"""
 
 import pytest
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agents import checkpointers
@@ -16,8 +15,9 @@ async def _reset(tmp_path, monkeypatch):
     await checkpointers.close_checkpointer()
 
 
-def test_uninitialized_falls_back_to_memory():
-    assert isinstance(checkpointers.get_checkpointer(), InMemorySaver)
+def test_uninitialized_requires_explicit_lifecycle():
+    with pytest.raises(RuntimeError, match="not initialized"):
+        checkpointers.get_checkpointer()
 
 
 async def test_init_creates_sqlite_file_and_is_idempotent(tmp_path):

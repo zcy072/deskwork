@@ -63,6 +63,9 @@ async def init_db() -> None:
     async with _engine.begin() as conn:
         await conn.run_sync(_add_missing_columns)
         await conn.run_sync(Base.metadata.create_all)
+        from app.db.migrations import migrate_runs
+
+        await conn.run_sync(migrate_runs)
         # 查询直接用 owner == ? 以命中索引,所以旧数据里的 NULL 统一规范成 ""
         for model in (Conversation, Memory):
             await conn.execute(update(model).where(model.owner.is_(None)).values(owner=""))

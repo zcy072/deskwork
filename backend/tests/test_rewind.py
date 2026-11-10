@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.config import settings
-from app.db import close_db, init_db, repository
+from app.db import close_db, init_db, repository, runs
 from app.services import chat_operations as chat
 from app.services.history import TurnRecorder, persist_assistant_turn, persist_user_turn
 
@@ -36,22 +36,28 @@ def agent(monkeypatch):
     saver = InMemorySaver()
     ag = create_agent(model=GenericFakeChatModel(messages=_replies()), tools=[], checkpointer=saver)
     monkeypatch.setattr(chat, "get_agent", lambda: ag)
-    monkeypatch.setattr(chat, "get_checkpointer", lambda: saver)
     return ag
 
 
 async def _texts(agent, sid):
-    state = await agent.aget_state({"configurable": {"thread_id": sid}})
+    state = await agent.aget_state(await runs.graph_config(sid))
     return [m.content for m in state.values.get("messages", [])]
 
 
 async def _turn(agent, sid, text, files=()):
     """模拟 start_chat + _run_agent 的落库与 checkpoint 记录,不经过 Redis。"""
-    config = {"configurable": {"thread_id": sid}}
+    config = await runs.graph_config(sid)
     prompt_id = f"p-{text}"
     await persist_user_turn(sid, prompt_id, text, list(files))
     await chat._record_checkpoint(agent, config, sid, prompt_id)
     await agent.ainvoke({"messages": [HumanMessage(text)]}, config)
+    from app.db import get_session
+    from app.db.models import Conversation
+
+    async with get_session() as db_session:
+        conversation = await db_session.get(Conversation, sid)
+        conversation.graph_checkpoint_id = None
+        await db_session.commit()
     r = TurnRecorder()
     r.record("ai.token", {"text": f"reply-{text}"})
     await persist_assistant_turn(sid, prompt_id, r, "complete")

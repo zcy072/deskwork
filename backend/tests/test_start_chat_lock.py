@@ -24,6 +24,7 @@ def stubbed(monkeypatch):
         return None
 
     async def upload(_sid, _uploads):
+        await asyncio.sleep(0)
         return []
 
     monkeypatch.setattr(ops, "get_thread_status", get_status)
@@ -43,7 +44,6 @@ def stubbed(monkeypatch):
         "_launch_agent_task",
         lambda *a, **k: calls.__setitem__("launched", calls["launched"] + 1),
     )
-    ops._starting_sessions.discard("s1")
     return calls
 
 
@@ -63,7 +63,7 @@ async def test_failure_after_running_resets_status(stubbed, monkeypatch):
     with pytest.raises(RuntimeError):
         await ops.start_chat("s1", "hi", [])
     assert stubbed["status"] == ["running", "error"]
-    assert "s1" not in ops._starting_sessions
+    assert ops.sessions.get("s1") is None
     # 已推过事件的流要收尾(设过期),登记的 prompt_id 也要清掉
     assert len(stubbed["done"]) == 1
     assert ops.get_active_prompt_id("s1") is None
@@ -101,10 +101,10 @@ async def test_cancel_during_startup_waits_for_task(stubbed, monkeypatch):
     await asyncio.sleep(0.1)
     assert not cancel.done()  # 在等任务建起来
     gate.set()
-    prompt_id = await start
+    await start
     _, cancelled = await cancel
     assert cancelled
-    assert prompt_id not in ops._active_prompt_ids.values()
+    assert ops.get_active_prompt_id("s1") is None
 
 
 async def test_upload_failure_does_not_rewind(stubbed, monkeypatch):
@@ -142,10 +142,11 @@ async def test_started_marker_is_per_prompt(monkeypatch):
     monkeypatch.setattr(ops, "_push", noop)
     monkeypatch.setattr(ops, "persist_assistant_turn", noop)
     monkeypatch.setattr(ops, "mark_done", noop)
-    ops._started_prompts.add("other-prompt")
+    other = ops.sessions.reserve("other")
+    other.prompt_id = "other-prompt"
     await ops._run_agent("p-new", "s1", "q")
-    assert ops._started_prompts == {"other-prompt"}
-    ops._started_prompts.discard("other-prompt")
+    assert ops.sessions.get("other") is other
+    ops.sessions.release(other)
 
 
 async def test_assistant_turn_persisted_before_status_complete(monkeypatch):
@@ -287,48 +288,60 @@ async def test_delete_refused_while_starting(monkeypatch):
     """B6:启动中的会话不能被删除,删除期间也不能启动。"""
     from app.services import conversation_cleanup as cc
 
-    ops._starting_sessions.add("s2")
+    starting = ops.sessions.reserve("s2")
     try:
         with pytest.raises(ops.ActiveRunError):
             await cc.delete_conversation_data("s2")
     finally:
-        ops._starting_sessions.discard("s2")
+        ops.sessions.release(starting)
 
-    ops._deleting_sessions.add("s3")
+    deleting = ops.sessions.reserve("s3", "delete")
     try:
         with pytest.raises(ops.ActiveRunError):
             await ops.start_chat("s3", "hi", [])
     finally:
-        ops._deleting_sessions.discard("s3")
+        ops.sessions.release(deleting)
 
 
-async def test_same_request_id_returns_original_prompt(stubbed):
+async def test_same_request_id_returns_original_prompt(stubbed, request_db):
     first = await ops.start_chat("s1", "hi", [], client_request_id="r1")
     again = await ops.start_chat("s1", "hi", [], client_request_id="r1")
     assert again == first
     assert stubbed["launched"] == 1
 
 
-async def test_request_id_with_different_content_is_rejected(stubbed):
+async def test_request_id_with_different_content_is_rejected(stubbed, request_db):
     await ops.start_chat("s1", "hi", [], client_request_id="r2")
-    with pytest.raises(ops.RequestIdConflictError):
+    with pytest.raises(ops.run_store.RequestIdConflictError):
         await ops.start_chat("s1", "other", [], client_request_id="r2")
     assert stubbed["launched"] == 1
 
 
-async def test_request_id_is_scoped_to_owner(stubbed):
+async def test_request_id_is_scoped_to_session(stubbed, request_db):
     a = await ops.start_chat("s1", "hi", [], owner="a", client_request_id="r3")
-    ops._active_agent_tasks.pop("s1", None)
-    b = await ops.start_chat("s1", "hi", [], owner="b", client_request_id="r3")
+    b = await ops.start_chat("s2", "hi", [], owner="b", client_request_id="r3")
     assert a != b
     assert stubbed["launched"] == 2
 
 
-async def test_failed_start_is_not_remembered(stubbed, monkeypatch):
+async def test_failed_start_is_not_remembered(stubbed, request_db, monkeypatch):
     async def boom(*_a, **_k):
         raise RuntimeError("redis down")
 
-    monkeypatch.setattr(ops, "persist_user_turn", boom)
+    monkeypatch.setattr(ops.run_store, "accept", boom)
     with pytest.raises(RuntimeError):
         await ops.start_chat("s1", "hi", [], client_request_id="r4")
-    assert ("", "s1", "r4") not in ops._accepted_requests
+    assert await ops.run_store.accepted("s1", "", "r4", "") is None
+
+
+@pytest.fixture
+async def request_db(tmp_path, monkeypatch):
+    from app.config import settings
+    from app.db import close_db, init_db
+
+    monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(settings, "DATABASE_URL", "")
+    await close_db()
+    await init_db()
+    yield
+    await close_db()

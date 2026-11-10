@@ -7,6 +7,7 @@ from langgraph.config import get_stream_writer
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.context import RunContext, session_id_of
 from app.sandbox import CONTAINER_MANAGER
 from app.sandbox.constants import COMMAND_TIMEOUT_SEC
 from app.sandbox.errors import ContainerFileSystemError
@@ -26,11 +27,11 @@ from app.tools.tool_descriptions import (
     STR_REPLACE_DESCRIPTION,
     VIEW_FILE_DESCRIPTION,
 )
-from app.utils import logger
+from app.utils import get_trace_id, logger
 
 
 def _session_id(runtime: ToolRuntime) -> str:
-    return runtime.config.get("configurable", {})["thread_id"]
+    return session_id_of(runtime)
 
 
 def _file_tool_response(
@@ -63,9 +64,11 @@ def _file_errors_as_feedback(action: str):
                 return await fn(*args, **kwargs)
             except ContainerFileSystemError as exc:
                 return _file_tool_response(runtime, f"Error: {exc}", is_error=True)
-            except Exception as exc:
-                logger.error(f"Error {action}: {exc}")
-                return _file_tool_response(runtime, f"Error: {exc}", is_error=True)
+            except Exception:
+                logger.exception("Error %s", action)
+                return _file_tool_response(
+                    runtime, f"工具执行失败(trace id: {get_trace_id()})", is_error=True
+                )
 
         return wrapper
 
@@ -100,14 +103,18 @@ async def bash_tool(
     try:
         session_id = _session_id(runtime)
         new_timeout = COMMAND_TIMEOUT_SEC if not timeout else min(timeout, COMMAND_TIMEOUT_SEC)
-        feedback, is_error = await CONTAINER_MANAGER.bash_tool_helper(
-            session_id, command, new_timeout, restart
-        )
+        if isinstance(runtime.context, RunContext) and runtime.context.workspace_mode == "read":
+            session = await CONTAINER_MANAGER.get_or_create(session_id)
+            feedback, is_error = await session.execute_readonly(command, new_timeout)
+        else:
+            feedback, is_error = await CONTAINER_MANAGER.bash_tool_helper(
+                session_id, command, new_timeout, restart
+            )
         # 命令和输出预览已由 BashSession.execute 记录
         logger.debug("bash_tool completed: is_error=%s chars=%d", is_error, len(feedback))
-    except Exception as e:
-        logger.error(f"Error executing command: {e}")
-        feedback = f"Error: {e}"
+    except Exception:
+        logger.exception("Error executing command")
+        feedback = f"命令执行失败(trace id: {get_trace_id()})"
         is_error = True
 
     return _file_tool_response(runtime, feedback, is_error=is_error)

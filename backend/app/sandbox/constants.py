@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 # Docker sandbox
-CONTAINER_NAME = "sandbox"
+CONTAINER_NAME = os.environ.get("SANDBOX_CONTAINER", "sandbox")
 CONTAINER_AGENT_USER = "agent"  # agent bash execution (restricted)
 
 # Host layout: sandbox_data/{sessions/<id>, default_skills}

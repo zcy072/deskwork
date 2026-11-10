@@ -256,13 +256,8 @@ async def test_download_sets_nosniff_and_sandbox_csp(client, monkeypatch, tmp_pa
     page = tmp_path / "output" / "a.html"
     page.write_text("<script>1</script>")
 
-    class P:
-        session_root = tmp_path
-
-        def resolve_host_path(self, _rel):
-            return page
-
-    monkeypatch.setattr(stream.SessionPaths, "create", staticmethod(lambda _sid: P()))
+    paths = stream.SessionPaths("s", tmp_path, "/workspace")
+    monkeypatch.setattr(stream.SessionPaths, "create", staticmethod(lambda _sid: paths))
     _keys(monkeypatch, "")
     r = await client.get(
         "/files/download", params={"session_id": "s", "relative_path": "output/a.html"}

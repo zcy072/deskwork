@@ -1,9 +1,12 @@
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import ToolMessage
+from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.context import RunContext, session_id_of
 from app.config import settings
+from app.services.budget import BudgetExceeded
 from app.services.image_view import NOT_CONFIGURED, describe_image, load_image, vision_enabled
 from app.tools.turn_limits import call_index_this_turn
 from app.utils import logger
@@ -29,14 +32,14 @@ class ViewImageInput(BaseModel):
         default="", description="What to find out about the image; empty = describe it in detail."
     )
     description: str = Field(..., description="How this tool call will be useful.")
-    runtime: ToolRuntime
+    runtime: ToolRuntime[RunContext]
 
 
 @tool(description=VIEW_IMAGE_DESCRIPTION, args_schema=ViewImageInput)
 async def view_image(
-    path: str, description: str, runtime: ToolRuntime, question: str = ""
+    path: str, description: str, runtime: ToolRuntime[RunContext], question: str = ""
 ) -> Command:
-    session_id = runtime.config.get("configurable", {})["thread_id"]
+    session_id = session_id_of(runtime)
     status = "error"
     try:
         if not vision_enabled():
@@ -53,6 +56,8 @@ async def view_image(
                 status = "success"
             else:
                 feedback = "Error: 视觉模型没有返回内容。"
+    except (BudgetExceeded, GraphBubbleUp):
+        raise
     except Exception as exc:
         logger.error(f"view_image failed: {exc}")
         feedback = f"Error: {exc}"

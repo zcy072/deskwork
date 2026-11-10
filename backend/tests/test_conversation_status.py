@@ -27,10 +27,10 @@ async def client(tmp_path, monkeypatch):
         return 1
 
     async def idle(ids):
-        return [None] * len(ids)
+        return {}
 
     monkeypatch.setattr(security, "incr_with_ttl", one)
-    monkeypatch.setattr(routes, "get_thread_statuses", idle)
+    monkeypatch.setattr(routes.run_store, "latest_statuses", idle)
     await close_db()
     await init_db()
     await persist_user_turn("s1", "p1", "hello", [], OA)
@@ -70,9 +70,9 @@ async def test_running_in_redis_overrides_stored_outcome(client, monkeypatch):
     await repository.set_run_outcome("s1", "complete")
 
     async def running(ids):
-        return ["running"] * len(ids)
+        return dict.fromkeys(ids, "running")
 
-    monkeypatch.setattr(routes, "get_thread_statuses", running)
+    monkeypatch.setattr(routes.run_store, "latest_statuses", running)
     item = await _item(client)
     assert (item["status"], item["unread"]) == ("running", False)
 
@@ -83,7 +83,7 @@ async def test_redis_failure_falls_back_to_stored_status(client, monkeypatch):
     async def down(_ids):
         raise ConnectionError("redis down")
 
-    monkeypatch.setattr(routes, "get_thread_statuses", down)
+    monkeypatch.setattr(routes.run_store, "latest_statuses", down)
     item = await _item(client)
     assert (item["status"], item["unread"]) == ("error", True)
 
@@ -202,6 +202,5 @@ async def test_run_agent_records_cancelled(run_env, monkeypatch):
         yield None
 
     monkeypatch.setattr(ops, "get_agent", lambda: _fake_agent(stream))
-    with pytest.raises(asyncio.CancelledError):
-        await ops._run_agent("p1", "s1", "q")
+    await ops._run_agent("p1", "s1", "q")
     assert run_env == ["cancelled"]

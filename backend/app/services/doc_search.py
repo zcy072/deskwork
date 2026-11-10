@@ -379,6 +379,23 @@ async def get_index(session_id: str, virtual_path: str) -> Bm25Index:
     return await asyncio.shield(task)
 
 
+async def drain_indexes(session_id: str | None = None) -> None:
+    from app.runtime.sessions import complete_before_cancelling
+
+    tasks = [
+        task for key, task in list(_INFLIGHT.items()) if session_id is None or key[0] == session_id
+    ]
+    if tasks:
+
+        async def drain():
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await complete_before_cancelling(asyncio.create_task(drain()))
+    for key in list(_CACHE):
+        if session_id is None or key[0] == session_id:
+            _CACHE.pop(key, None)
+
+
 def source_references(index: Bm25Index, results: list[tuple[Chunk, float]]) -> list[dict]:
     if not index.source_path or not index.fingerprint:
         return []

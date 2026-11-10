@@ -12,18 +12,18 @@ TMPFS_SIZE = 512 * 1024 * 1024
 READONLY_SUBDIRS = frozenset({"uploads"})
 
 
-def workspace_binds(paths: SessionPaths) -> list[str]:
+def workspace_binds(paths: SessionPaths, *, readonly: bool = False) -> list[str]:
     """把物理会话目录和全局 skills 挂到固定的 /workspace 树上。"""
     args: list[str] = ["--dir", paths.virtual_root]
     for name in sorted(SESSION_SUBDIRS):
         physical = f"{paths.container_root}/{name}"
-        bind_flag = "--ro-bind" if name in READONLY_SUBDIRS else "--bind"
+        bind_flag = "--ro-bind" if readonly or name in READONLY_SUBDIRS else "--bind"
         args.extend([bind_flag, physical, paths.virtual_subdir(name)])
     args.extend(["--ro-bind", CONTAINER_DEFAULT_SKILLS, paths.virtual_skills])
     return args
 
 
-def base_argv(paths: SessionPaths, home: str) -> list[str]:
+def base_argv(paths: SessionPaths, home: str, *, readonly: bool = False) -> list[str]:
     """bwrap 的全部隔离参数(不含要运行的程序)。"""
     return [
         "bwrap",
@@ -55,7 +55,7 @@ def base_argv(paths: SessionPaths, home: str) -> list[str]:
         str(TMPFS_SIZE),
         "--tmpfs",
         "/tmp",
-        *workspace_binds(paths),
+        *workspace_binds(paths, readonly=readonly),
         "--chdir",
         paths.virtual_scratchpad,
         "--new-session",
@@ -86,9 +86,10 @@ def base_argv(paths: SessionPaths, home: str) -> list[str]:
     ]
 
 
-def shell_argv(paths: SessionPaths) -> list[str]:
+def shell_argv(paths: SessionPaths, *, readonly: bool = False) -> list[str]:
     """会话常驻 shell:HOME 为 scratchpad,不读 profile/rc。"""
-    return [*base_argv(paths, paths.virtual_scratchpad), "bash", "--noprofile", "--norc"]
+    home = "/tmp" if readonly else paths.virtual_scratchpad
+    return [*base_argv(paths, home, readonly=readonly), "bash", "--noprofile", "--norc"]
 
 
 def oneshot_argv(paths: SessionPaths, command: str) -> list[str]:

@@ -1,5 +1,6 @@
 """present_files 覆盖同名产物时保留历史版本。"""
 
+import asyncio
 import os
 from types import SimpleNamespace
 
@@ -66,6 +67,7 @@ def test_symlink_dest_not_archived(paths, tmp_path):
 async def test_present_archives_previous(paths, monkeypatch):
     src = paths.scratchpad / "a.txt"
     session = SimpleNamespace(
+        workspace_lock=asyncio.Lock(),
         paths=SimpleNamespace(
             output=paths.output,
             session_root=paths.session_root,
@@ -236,6 +238,7 @@ def test_find_delivered_rejects_bad_name(paths):
 async def test_present_records_digest(paths, monkeypatch):
     src = paths.scratchpad / "a.txt"
     session = SimpleNamespace(
+        workspace_lock=asyncio.Lock(),
         paths=SimpleNamespace(
             output=paths.output,
             session_root=paths.session_root,

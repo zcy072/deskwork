@@ -65,6 +65,15 @@ def test_recorder_tool_call_text_becomes_text_part():
     assert r.parts[1]["type"] == "tool_call"
 
 
+def test_streamed_tool_preamble_matches_live_history():
+    r = TurnRecorder()
+    r.record("ai.token", {"text": "先读取"})
+    r.record("ai.tool_call", {"text": "先读取", "tool_calls": [{"id": "a", "name": "read"}]})
+    r.record("tool.result", {"id": "a", "content": "ok"})
+    r.record("ai.tool_call", {"text": "再检查", "tool_calls": [{"id": "b", "name": "check"}]})
+    assert r.text == "先读取再检查"
+
+
 # ---------- repository ----------
 
 

@@ -15,10 +15,19 @@ class BudgetExceeded(Exception):
 
 
 class BudgetGuard:
-    def __init__(self, max_llm_calls: int, max_total_tokens: int, max_repeated_calls: int):
+    def __init__(
+        self,
+        max_llm_calls: int,
+        max_total_tokens: int,
+        max_repeated_calls: int,
+        initial_calls: int = 0,
+        initial_tokens: int = 0,
+    ):
         self.max_llm_calls = max_llm_calls
         self.max_total_tokens = max_total_tokens
         self.max_repeated_calls = max_repeated_calls
+        self.initial_calls = initial_calls
+        self.initial_tokens = initial_tokens
         self._last_signature: str | None = None
         self._repeat_count = 0
 
@@ -30,12 +39,15 @@ class BudgetGuard:
     def check(self, usage: UsageTracker, tool_calls: list[dict] | None = None) -> None:
         """在一次 LLM 调用完成(其 usage 已累加、tool_calls 已解析)后调用。"""
         event = usage.to_event()
-        if self.max_llm_calls and event["llm_calls"] > self.max_llm_calls:
+        if self.max_llm_calls and event["llm_calls"] + self.initial_calls > self.max_llm_calls:
             raise BudgetExceeded(
                 f"已达到单轮对话的模型调用上限({self.max_llm_calls} 次),任务被中止。"
                 "可以把任务拆小后重试。"
             )
-        if self.max_total_tokens and event["total_tokens"] > self.max_total_tokens:
+        if (
+            self.max_total_tokens
+            and event["total_tokens"] + self.initial_tokens > self.max_total_tokens
+        ):
             raise BudgetExceeded(
                 f"已达到单轮对话的 token 上限({self.max_total_tokens}),任务被中止。"
             )

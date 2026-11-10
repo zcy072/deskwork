@@ -170,6 +170,30 @@ async def add_token(prompt_id: str, token: str) -> None:
     await redis.expire(key, THREAD_RUNNING_TTL_SECONDS)
 
 
+async def append_existing(prompt_id: str, token: str) -> None:
+    """Do not silently recreate a stream whose earlier events were lost."""
+    result = await _client().eval(
+        "if redis.call('EXISTS', KEYS[1]) == 0 then return false end "
+        "local id = redis.call('XADD', KEYS[1], '*', 'token', ARGV[1]); "
+        "redis.call('EXPIRE', KEYS[1], ARGV[2]); return id",
+        1,
+        _stream_key(prompt_id),
+        token,
+        THREAD_RUNNING_TTL_SECONDS,
+    )
+    if not result:
+        raise RuntimeError("Run event stream was lost")
+
+
+async def stream_exists(prompt_id: str) -> bool:
+    return bool(await _client().exists(_stream_key(prompt_id)))
+
+
+async def finish_existing_stream(prompt_id: str) -> None:
+    await append_existing(prompt_id, DONE_TOKEN)
+    await _client().expire(_stream_key(prompt_id), STREAM_TTL_SECONDS)
+
+
 async def mark_done(prompt_id: str) -> None:
     redis = _client()
 

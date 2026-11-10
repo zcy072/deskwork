@@ -1,11 +1,12 @@
 """会话 / 消息 / 文件元数据的读写。上层服务只通过这里访问数据库。"""
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select, update
 
 from app.db import get_session
-from app.db.models import Conversation, Memory, Message, UploadedFile
+from app.db.models import Conversation, Memory, Message, Run, UploadedFile
 
 TITLE_MAX_CHARS = 40
 
@@ -216,6 +217,7 @@ async def import_conversation(
     created_at: datetime,
     updated_at: datetime,
     messages: list[dict],
+    graph_checkpoint_id: str | None = None,
 ) -> None:
     """一个事务里建出会话、消息和附件记录;消息 id 重新分配。已有同 id 会话时抛 NotOwnerError。"""
     async with get_session() as s:
@@ -230,12 +232,18 @@ async def import_conversation(
                 updated_at=updated_at,
                 last_run_status=None,
                 unread=False,
+                graph_checkpoint_id=graph_checkpoint_id,
             )
         )
+        await s.flush()
+        prompt_map = {m["prompt_id"]: str(uuid.uuid4()) for m in messages if m["prompt_id"]}
+        turn_map = {}
+        imported_runs = {}
         for m in messages:
+            pid = prompt_map.get(m["prompt_id"], "")
             msg = Message(
                 conversation_id=conversation_id,
-                prompt_id=m["prompt_id"],
+                prompt_id=pid,
                 role=m["role"],
                 content=m["content"],
                 parts=m["parts"],
@@ -243,8 +251,35 @@ async def import_conversation(
                 checkpoint_id=m["checkpoint_id"],
                 usage=m["usage"],
                 created_at=m["created_at"],
+                last_event_seq=m.get("last_event_seq", 0),
             )
             s.add(msg)
+            if pid:
+                metadata = m.get("run") or {}
+                turn = metadata.get("turn_id") or m["prompt_id"]
+                turn_map.setdefault(turn, str(uuid.uuid4()))
+                run = imported_runs.get(pid)
+                if run is None:
+                    run = imported_runs[pid] = Run(
+                        id=pid,
+                        conversation_id=conversation_id,
+                        turn_id=turn_map[turn],
+                        input_json={"imported": True, "source_run_id": m["prompt_id"]},
+                        input_committed=False,
+                        created_at=m["created_at"],
+                        status="complete",
+                    )
+                    s.add(run)
+                if metadata.get("input_committed") is not None:
+                    run.input_committed = metadata["input_committed"]
+                elif m["role"] == "user" and m["status"] == "complete":
+                    run.input_committed = True
+                if metadata or m["role"] == "assistant":
+                    run.status = metadata.get("status") or m["status"]
+                    run.error_code = metadata.get("error_code") or None
+                    run.public_error = metadata.get("public_error") or None
+                    run.usage = m["usage"]
+                    run.finished_at = m["created_at"]
             if m["attachments"]:
                 await s.flush()
                 s.add_all(

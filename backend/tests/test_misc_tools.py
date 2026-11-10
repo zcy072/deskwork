@@ -92,7 +92,7 @@ async def test_file_tool_errors_become_error_messages(monkeypatch):
     monkeypatch.setattr(file_tools, "create_container_file", boom_any)
     for tool, kwargs, text in [
         (file_tools.view_file, {"path": "p"}, "Error: nope"),
-        (file_tools.create_file, {"path": "p", "file_text": "x"}, "Error: kaput"),
+        (file_tools.create_file, {"path": "p", "file_text": "x"}, "工具执行失败(trace id: -)"),
     ]:
         cmd = await tool.coroutine(description="d", runtime=RT({}), **kwargs)
         msg = cmd.update["messages"][0]

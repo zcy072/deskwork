@@ -15,25 +15,25 @@ class UsageTracker:
         self.by_model: dict[str, dict[str, int]] = {}
         self.models: list[str] = []  # 实际响应的模型(按首次出现排序),回退发生时会有多个
         self._seen: set[str] = set()
+        self._usage_seen: set[str] = set()
 
     def add(self, message: Any) -> None:
         """累加一条 AIMessage 的用量;同一条消息(按 id)只计一次。
 
         流式 + updates 模式下同一条消息可能被多次看到,所以必须去重。
         """
-        usage = getattr(message, "usage_metadata", None)
-        if not usage:
-            return
-        message_id = getattr(message, "id", None)
-        if message_id:
-            if message_id in self._seen:
-                return
+        message_id = getattr(message, "id", None) or f"object:{id(message)}"
+        if message_id not in self._seen:
             self._seen.add(message_id)
-        self.llm_calls += 1
+            self.llm_calls += 1
         metadata = getattr(message, "response_metadata", None) or {}
         model = metadata.get("model_name") or metadata.get("model")
         if model and model not in self.models:
             self.models.append(model)
+        usage = getattr(message, "usage_metadata", None)
+        if not usage or message_id in self._usage_seen:
+            return
+        self._usage_seen.add(message_id)
         tin, tout = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
         self.input_tokens += tin
         self.output_tokens += tout
@@ -52,6 +52,7 @@ class UsageTracker:
             "cache_read_tokens": self.cache_read_tokens,
             "models": list(self.models),
             "by_model": self.by_model,
+            "missing_usage_calls": self.llm_calls - len(self._usage_seen),
         }
 
 

@@ -8,17 +8,22 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.agents import get_agent
 from app.agents.checkpointers import close_checkpointer, init_checkpointer
 from app.agents.permissions import parse_policy
 from app.api.routes import routes
 from app.api.security import require_api_key, warn_if_auth_disabled
 from app.config import settings
 from app.db import close_db, init_db, repository
+from app.db.runs import recover_interrupted
 from app.owner import owner_of_key
+from app.runtime.sessions import sessions
 from app.sandbox import CONTAINER_MANAGER
+from app.sandbox.constants import SESSION_ROOT
 from app.services import session_export
 from app.services.conversation_cleanup import retry_pending_purges
 from app.services.mcp_client import init_mcp
+from app.services.rewind import recover_operations
 from app.utils import (
     close_redis,
     connect_redis,
@@ -31,6 +36,7 @@ from app.utils import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    sessions.closing = False
     warn_if_auth_disabled()
     # 限制性配置写错不能静默当成"不限制":直接拒绝启动
     parse_policy(settings.TOOL_POLICY)
@@ -56,7 +62,10 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Adopting legacy rows failed")
         await init_checkpointer()
+        await recover_operations(SESSION_ROOT)
         await init_mcp()
+        app.state.agent = get_agent()
+        await recover_interrupted(app.state.agent)
         try:
             await asyncio.to_thread(session_export.sweep_stale_archives)
         except Exception:
@@ -67,10 +76,20 @@ async def lifespan(app: FastAPI):
             logger.exception("Retrying pending sandbox purges failed")
         yield
     finally:
-        await CONTAINER_MANAGER.close_all()
-        await close_checkpointer()
-        await close_db()
-        await close_redis()
+        from app.services.chat_operations import shutdown_runs
+
+        for close in (
+            shutdown_runs,
+            CONTAINER_MANAGER.close_all,
+            close_checkpointer,
+            close_db,
+            close_redis,
+        ):
+            try:
+                await close()
+            except Exception:
+                logger.exception("Application resource cleanup failed: %s", close.__name__)
+        get_agent.cache_clear()
 
 
 app = FastAPI(

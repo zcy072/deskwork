@@ -8,6 +8,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 
+from app.agents.recovery import _unanswered_interrupts
 from app.config import settings
 from app.db import close_db, init_db
 from app.services import chat_operations as chat
@@ -75,7 +76,6 @@ async def env(tmp_path, monkeypatch):
     # 助手消息要挂在已存在的会话上,否则外键约束会让终态落库失败(现在会如实报错)
     await persist_user_turn("s1", "p1", "转换文档", [])
     monkeypatch.setattr(chat, "get_agent", lambda: ag)
-    monkeypatch.setattr(chat, "get_checkpointer", lambda: saver)
     monkeypatch.setattr(chat, "_push", fake_push)
     monkeypatch.setattr(chat, "set_thread_status", fake_status)
     monkeypatch.setattr(chat, "mark_done", noop)
@@ -97,7 +97,11 @@ async def test_interrupt_emits_ask_event_and_waits(env, monkeypatch):
     monkeypatch.setattr(chat, "_record_outcome", record)
     await chat._run_agent("p1", "s1", "<user_query>\n转换文档\n</user_query>", "转换文档")
 
-    ask = [d for e, d in events if e == "ask.user"]
+    ask = [
+        {k: v for k, v in d.items() if k not in ("interrupt_id", "run_id", "seq", "schema_version")}
+        for e, d in events
+        if e == "ask.user"
+    ]
     assert ask == [
         {"question": "输出什么格式?", "kind": "single_select", "options": ["PDF", "Word"]}
     ]
@@ -110,7 +114,7 @@ async def test_interrupt_emits_ask_event_and_waits(env, monkeypatch):
 
 async def _pending(agent, cfg):
     """当前要回答的提问 payload(没有则 None)。"""
-    pending = chat._unanswered_interrupts(await agent.aget_state(cfg))
+    pending = _unanswered_interrupts(await agent.aget_state(cfg))
     return pending[0].value if pending else None
 
 
@@ -229,7 +233,6 @@ async def test_parallel_questions_are_shown_and_answered_one_at_a_time(env, monk
         checkpointer=saver,
     )
     monkeypatch.setattr(chat, "get_agent", lambda: ag)
-    monkeypatch.setattr(chat, "get_checkpointer", lambda: saver)
     cfg = {"configurable": {"thread_id": "s1"}}
 
     await chat._run_agent("p1", "s1", "<user_query>\nx\n</user_query>", "x")

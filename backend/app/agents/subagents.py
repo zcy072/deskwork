@@ -44,7 +44,7 @@ visual_designer_sub_agent = {
 
 # 只读角色:没有 create_file / str_replace / insert,不能改文件。
 # bash_tool 留给它们做只读检查(如用 python 读 docx / xlsx),提示词里禁止写入;
-# 这是提示词层面的约束,不是沙箱层面的隔离。
+# 实际委派时传入 read workspace_mode,bash 使用单独的只读 bwrap 视图。
 READ_ONLY_TOOLS = ["bash_tool", "view_file", "search_document"]
 
 planner_sub_agent = {

@@ -3,6 +3,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.context import session_id_of
 from app.config import settings
 from app.sandbox import CONTAINER_MANAGER
 from app.services import web_access
@@ -84,7 +85,7 @@ class WebFetchInput(BaseModel):
 
 async def _save_full(runtime: ToolRuntime, content: str) -> str | None:
     try:
-        session_id = runtime.config.get("configurable", {})["thread_id"]
+        session_id = session_id_of(runtime)
         session = await CONTAINER_MANAGER.get_or_create(session_id)
         paths = session.paths
     except Exception as exc:

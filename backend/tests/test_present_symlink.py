@@ -1,5 +1,6 @@
 """present_files 不能顺着 output/ 里 agent 预先建的符号链接写到别处。"""
 
+import asyncio
 from types import SimpleNamespace
 
 from app.tools import executor
@@ -11,6 +12,7 @@ class FakeSession:
         self.scratch = tmp_path / "scratchpad"
         self.output.mkdir()
         self.scratch.mkdir()
+        self.workspace_lock = asyncio.Lock()
         self.paths = SimpleNamespace(
             output=self.output,
             session_root=tmp_path,

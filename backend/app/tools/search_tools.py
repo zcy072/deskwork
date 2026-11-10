@@ -4,6 +4,7 @@ from langgraph.config import get_stream_writer
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.context import session_id_of
 from app.services.doc_search import (
     Bm25Index,
     format_results,
@@ -42,7 +43,7 @@ class SearchDocumentInput(BaseModel):
 async def search_document(
     path: str, query: str, description: str, runtime: ToolRuntime, top_k: int = 5
 ) -> Command:
-    session_id = runtime.config.get("configurable", {})["thread_id"]
+    session_id = session_id_of(runtime)
     try:
         index: Bm25Index = await get_index(session_id, path)
         results = await search_index(index, query, top_k)

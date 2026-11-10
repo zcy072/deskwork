@@ -41,11 +41,11 @@ def archive_previous(paths: SessionPaths, dest: Path) -> Path | None:
         return None
 
 
-def finish_archive(paths: SessionPaths, dest: Path, archived: Path | None) -> None:
+def finish_archive(paths: SessionPaths, dest: Path, archived: Path | None) -> bool:
     """只在交付成功后调用:归档旧内容,原子更新交付副本,裁剪历史。"""
     try:
         if dest.is_symlink() or not dest.is_file():
-            return
+            return False
         directory = _dir(paths, dest.name)
         if archived is not None and _same_content(archived, dest):
             if archived.name != CURRENT:
@@ -55,15 +55,16 @@ def finish_archive(paths: SessionPaths, dest: Path, archived: Path | None) -> No
         directory.mkdir(parents=True, exist_ok=True)
         if dest.stat().st_size <= MAX_BYTES:
             # 不能直接覆盖 .current:复制失败时仍要保留上次成功交付。
-            _atomic_copy(dest, directory / CURRENT)
+            copy_file_atomic(dest, directory / CURRENT)
         else:
             (directory / CURRENT).unlink(missing_ok=True)
         _prune(directory)
+        return (directory / CURRENT).is_file()
     except OSError:
-        pass
+        return False
 
 
-def _atomic_copy(source: Path, target: Path) -> None:
+def copy_file_atomic(source: Path, target: Path) -> None:
     with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".delivery-", delete=False) as f:
         temporary = Path(f.name)
     try:
@@ -94,7 +95,7 @@ def _archive_copy(source: Path, directory: Path) -> Path:
             return target
         version += 1
         target = directory / str(version)
-    _atomic_copy(source, target)
+    copy_file_atomic(source, target)
     return target
 
 

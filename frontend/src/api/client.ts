@@ -7,6 +7,7 @@ import type {
   MessageRow,
   SearchHit,
   StreamPacket,
+  SavedRun,
 } from '@/types'
 import { parseSseChunk } from '@/utils/sse'
 
@@ -80,22 +81,40 @@ async function ensureOk(res: Response): Promise<Response> {
   if (res.ok) return res
   if (res.status === 401) unauthorizedHandler?.()
   let detail = res.statusText
+  let code: string | undefined
   try {
     const body = await res.json()
     if (typeof body.detail === 'string') detail = body.detail
+    else if (body.detail && typeof body.detail.message === 'string') {
+      detail = body.detail.message
+      code = body.detail.code
+    }
   } catch {
     // 非 JSON 响应,沿用 statusText
   }
-  throw new ApiError(res.status, detail)
+  throw new ApiError(res.status, detail, code)
 }
 
 export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    public code?: string,
   ) {
     super(message)
   }
+}
+
+export class SendUncertainError extends Error {
+  constructor(public requestId: string, cause: unknown) {
+    super(cause instanceof Error ? cause.message : '无法确认请求是否已接受')
+  }
+}
+
+export async function getAcceptedRun(sessionId: string, requestId: string): Promise<{ id: string; status: string } | null> {
+  const res = await rawFetch(`/conversations/${sessionId}/requests/${encodeURIComponent(requestId)}`)
+  if (res.status === 404) return null
+  return (await ensureOk(res)).json()
 }
 
 export async function sendMessage(
@@ -103,28 +122,36 @@ export async function sendMessage(
   text: string,
   files: File[],
   rewindToMessageId?: number,
+  options: { conversationOnly?: boolean; interruptId?: string } = {},
 ): Promise<string> {
   const form = new FormData()
   form.append('session_id', sessionId)
   form.append('user_query', text)
   for (const f of files) form.append('files', f)
   if (rewindToMessageId !== undefined) form.append('rewind_to_message_id', String(rewindToMessageId))
+  if (options.conversationOnly) form.append('rewind_mode', 'conversation_only')
+  if (options.interruptId) {
+    form.append('mode', 'resume')
+    form.append('interrupt_id', options.interruptId)
+  }
   // 同一次发送的重试共用这个 ID:服务端可能已接受请求而响应丢失,凭 ID 返回原 prompt_id,不会再起一轮
-  form.append('client_request_id', crypto.randomUUID())
+  const requestId = crypto.randomUUID()
+  form.append('client_request_id', requestId)
   for (let attempt = 0; ; attempt++) {
     try {
       const res = await requestJson<{ prompt_id: string }>('/send-message', { method: 'POST', body: form })
       return res.prompt_id
     } catch (e) {
       // 只重试没拿到 HTTP 响应的网络错误;服务端明确拒绝(ApiError)原样抛出
-      if (e instanceof ApiError || attempt >= SEND_RETRIES) throw e
+      if (e instanceof ApiError) throw e
+      if (attempt >= SEND_RETRIES) throw new SendUncertainError(requestId, e)
       await new Promise((r) => setTimeout(r, SEND_RETRY_DELAY_MS * (attempt + 1)))
     }
   }
 }
 
 export interface StreamOptions {
-  /** 连续失败多少次后查询线程状态(默认 5) */
+  /** 连续失败或空响应多少次后查询当前 Run(默认 5) */
   maxFailures?: number
   /** 退避起点与上限,毫秒 */
   backoffBaseMs?: number
@@ -156,10 +183,14 @@ function isFatal(e: unknown): boolean {
 /**
  * 读取一次运行的全部事件。服务端空闲 block_ms 后会主动结束响应,
  * 这里带着最后的 id 自动重连,直到收到 stream.end 或被 signal 中止。
- * 网络错误/5xx 按退避重试,连续失败过多后查询线程状态决定是继续还是报错;
+ * 网络错误/5xx 按退避重试,连续失败或空响应后查询具体 Run 补齐终态;
  * 长时间没有任何字节视为卡死,带着 start_id 重连。
  */
 class EmptyStreamError extends Error {}
+
+function runIsTerminal(run: SavedRun): boolean {
+  return ['complete', 'waiting', 'error', 'cancelled'].includes(run.status)
+}
 
 export async function* streamEvents(
   sessionId: string,
@@ -175,6 +206,8 @@ export async function* streamEvents(
   let lastId = '0-0'
   let failures = 0
   let emptyRuns = 0
+  // 状态查询也必须可取消且有超时,包括已超时的 SSE 请求之后的查询。
+  const savedRun = () => getRun(promptId, AbortSignal.any([signal, AbortSignal.timeout(idleMs)]))
   while (!signal.aborted) {
     const attempt = new AbortController()
     const onAbort = () => attempt.abort()
@@ -216,38 +249,70 @@ export async function* streamEvents(
           if (packet.event === 'stream.end') return
         }
       }
-      // 服务端立刻结束且没有任何事件(例如流已结束却没收到 stream.end):稍等再重连,避免空转打满请求
+      clearTimeout(timer)
+      // 阻塞 XREAD 后的空响应也要查询 Run;响应速度不能决定是否补齐终态。
       if (got > 0) {
         emptyRuns = 0
-      } else if (Date.now() - startedAt < 200) {
-        // 反复收到空响应:不能无限重连,达到上限后看线程状态,仍在运行就再给几轮,否则报错
+      } else {
         if (++emptyRuns >= maxFailures) {
-          const status = await getThreadStatus(sessionId).catch(() => null)
-          if (status?.status === 'running' && extraLeft > 0) {
+          const saved = await savedRun().catch(() => null)
+          if (signal.aborted) return
+          if (saved && runIsTerminal(saved)) {
+            yield { event: 'run.snapshot', data: saved }
+            yield { event: 'stream.end', data: { status: saved.status } }
+            return
+          }
+          if (saved && ['preparing', 'running', 'finalizing'].includes(saved.status)) {
+            // 正常长工具调用可以持续返回空流,不能耗尽网络错误的重试额度。
+            emptyRuns = 0
+          } else if (extraLeft > 0) {
             extraLeft--
             emptyRuns = 0
           } else {
             throw new EmptyStreamError('事件流提前结束,未收到结束标记')
           }
         }
-        await sleep(500, signal)
+        if (Date.now() - startedAt < 200) await sleep(500, signal)
       }
     } catch (e) {
       if (signal.aborted) return
       if (e instanceof EmptyStreamError) throw e
-      if (stalled) continue // 卡死:不算失败,直接带着 lastId 重连
+      if (e instanceof ApiError && e.status === 410) {
+        clearTimeout(timer)
+        const saved = await savedRun()
+        if (signal.aborted) return
+        yield { event: 'run.snapshot', data: saved }
+        if (runIsTerminal(saved)) {
+          yield { event: 'stream.end', data: { status: saved.status } }
+          return
+        }
+        // 丢流后 finalizer 可能尚未落库,继续查询直到它保存最终结果。
+        if (extraLeft <= 0) {
+          throw new EmptyStreamError('事件流已丢失,已载入最近保存的进度,请稍后重新打开会话')
+        }
+        extraLeft--
+        await sleep(1000, signal)
+        continue
+      }
       if (isFatal(e)) throw e
       failures++
       if (failures >= maxFailures) {
-        const status = await getThreadStatus(sessionId).catch(() => null)
-        if (status?.status === 'running' && extraLeft > 0) {
+        clearTimeout(timer)
+        const saved = await savedRun().catch(() => null)
+        if (signal.aborted) return
+        if (saved && runIsTerminal(saved)) {
+          yield { event: 'run.snapshot', data: saved }
+          yield { event: 'stream.end', data: { status: saved.status } }
+          return
+        }
+        if (saved && ['preparing', 'running', 'finalizing'].includes(saved.status) && extraLeft > 0) {
           extraLeft--
           failures = 0
         } else {
           throw e
         }
       }
-      await sleep(Math.min(maxMs, baseMs * 2 ** (failures - 1)), signal)
+      if (!stalled) await sleep(Math.min(maxMs, baseMs * 2 ** (failures - 1)), signal)
     } finally {
       clearTimeout(timer)
       signal.removeEventListener('abort', onAbort)
@@ -258,6 +323,10 @@ export async function* streamEvents(
 
 export async function cancelGeneration(sessionId: string): Promise<void> {
   await request(`/thread-cancel/${sessionId}`, { method: 'POST' })
+}
+
+export function getRun(id: string, signal?: AbortSignal): Promise<SavedRun> {
+  return requestJson(`/runs/${encodeURIComponent(id)}`, { signal })
 }
 
 /** 会话是否还有进行中的生成;没有记录(404)返回 null。 */

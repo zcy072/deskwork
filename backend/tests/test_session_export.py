@@ -7,6 +7,7 @@ import zipfile
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from langgraph.checkpoint.memory import InMemorySaver
 
 from app import app
 from app.api.routes import stream
@@ -144,6 +145,7 @@ async def _seed(owner: str = ""):
 @pytest.fixture
 def client_paths(paths, monkeypatch):
     monkeypatch.setattr(stream.SessionPaths, "create", staticmethod(lambda _sid: paths))
+    monkeypatch.setattr(stream, "get_checkpointer", lambda: InMemorySaver())
     return paths
 
 
@@ -170,7 +172,7 @@ async def test_export_endpoint_unknown_session_404(db, client_paths):
 
 async def test_export_endpoint_blocked_while_running(db, client_paths, monkeypatch):
     await _seed()
-    monkeypatch.setattr(stream, "get_active_prompt_id", lambda _sid: "p1")
+    stream.sessions.reserve("s")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         r = await c.get("/files/export", params={"session_id": "s"})
     assert r.status_code == 409

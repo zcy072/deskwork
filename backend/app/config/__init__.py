@@ -3,6 +3,7 @@ from functools import cache
 from pathlib import Path
 from urllib.parse import quote
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -26,6 +27,9 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.0
     # Anthropic 协议必须显式给出单次回复的输出上限;一次写很长的文件或脚本被截断时调大
     LLM_MAX_TOKENS: int = 8192
+    LLM_REQUEST_TIMEOUT_SECONDS: float = Field(default=180, gt=0)
+    # 每个执行片段的墙钟上限;人工等待不占用片段,0 表示关闭总上限。
+    AGENT_RUN_TIMEOUT_SECONDS: float = Field(default=1800, ge=0)
     # 主模型使用命名配置 LLM_<PROFILE>_*(留空 = 默认的 LLM_*);用于不改 .env 切换模型做对比
     LLM_PROFILE: str = ""
     # 主模型调用失败时按顺序切换的命名配置,逗号分隔,如 "deepseek,anthropic"

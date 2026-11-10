@@ -21,6 +21,7 @@ from typing import Any
 from app.config import settings
 from app.sandbox.session_paths import SessionPaths
 from app.services.checkpoint_transfer import (
+    PAYLOAD_VERSION,
     CheckpointRejected,
     ParsedCheckpoint,
     parse_payload,
@@ -35,7 +36,7 @@ from app.services.session_export import (
 )
 from app.services.storage import DELETABLE_DIRS
 
-SUPPORTED_VERSIONS = (1, 2, FORMAT_VERSION)
+SUPPORTED_VERSIONS = (1, 2, 3, FORMAT_VERSION)
 MAX_ARCHIVE_BYTES = 1280 * 1024 * 1024
 MAX_JSON_BYTES = 200 * 1024 * 1024
 MAX_MESSAGES = 50000
@@ -57,6 +58,7 @@ class ImportPlan:
     files: list[dict]  # {"path", "size", "sha256"}
     missing: list[str]
     checkpoint: ParsedCheckpoint | None = None
+    graph_checkpoint_id: str | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -126,10 +128,34 @@ def _clean_message(raw: Any, index: int, now: datetime) -> dict:
     if checkpoint_id is not None:
         checkpoint_id = _str(checkpoint_id, 64, "checkpoint_id")
     attachments = raw.get("attachments") or []
+    run = raw.get("run")
+    if run is not None:
+        if not isinstance(run, dict) or run.get("status") not in (
+            "complete",
+            "waiting",
+            "error",
+            "cancelled",
+        ):
+            raise ImportRejected("运行记录格式不对")
+        committed = run.get("input_committed")
+        if committed is not None and type(committed) is not bool:
+            raise ImportRejected("运行输入提交状态格式不对")
+        run = {
+            "status": run["status"],
+            "turn_id": _str(run.get("turn_id") or "", 64, "turn_id"),
+            "error_code": _str(run.get("error_code") or "", 64, "error_code"),
+            "public_error": _str(run.get("public_error") or "", 2000, "public_error"),
+            "input_committed": committed,
+        }
+    seq = raw.get("last_event_seq") or 0
+    if type(seq) is not int or not 0 <= seq < 2**63:
+        raise ImportRejected("事件序号格式不对")
     if not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS:
         raise ImportRejected(f"第 {index + 1} 条消息的附件格式不对")
     return {
         "role": role,
+        "run": run,
+        "last_event_seq": seq,
         "prompt_id": _str(raw.get("prompt_id") or "", 64, "prompt_id"),
         "content": _str(raw.get("content") or "", 10 * MB, "content"),
         "parts": parts,
@@ -237,12 +263,29 @@ def inspect_archive(archive: Path) -> ImportPlan:
     if reason:
         checkpoint_payload = None
         plan.warnings.append(f"{reason};已保留消息和文件,未恢复执行上下文,不能接续原上下文或回退")
+    # Older exports included this exact empty payload for sessions that never
+    # entered the graph. Accept it as absent context, not as a restorable graph.
+    if (
+        isinstance(checkpoint_payload, dict)
+        and type(checkpoint_payload.get("payload_version")) is int
+        and checkpoint_payload
+        == {"payload_version": PAYLOAD_VERSION, "checkpoints": [], "writes": []}
+    ):
+        if document.get("graph_checkpoint_id") not in (None, ""):
+            raise ImportRejected("选中的执行恢复点不在备份中")
+        checkpoint_payload = None
     if checkpoint_payload is not None:
         try:
             plan.checkpoint = parse_payload(checkpoint_payload)
         except CheckpointRejected as exc:
             raise ImportRejected(str(exc)) from exc
         known = plan.checkpoint.ids
+        cursor = document.get("graph_checkpoint_id")
+        if cursor is not None:
+            cursor = _str(cursor, 64, "graph_checkpoint_id")
+            if cursor not in known:
+                raise ImportRejected("选中的执行恢复点不在备份中")
+            plan.graph_checkpoint_id = cursor
         lost = 0
         for m in messages:
             # "" 是空线程(第一条消息之前),不在 checkpoint 表里

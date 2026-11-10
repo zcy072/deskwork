@@ -198,6 +198,8 @@ async def test_middleware_prepends_block_to_multimodal_message(db):
     seen = []
 
     class Req:
+        runtime = None
+
         def __init__(self, messages):
             self.messages = messages
 
@@ -299,6 +301,8 @@ async def test_middleware_touches_only_matched_and_once_per_turn(db, monkeypatch
     from langchain_core.messages import HumanMessage
 
     class Req:
+        runtime = None
+
         def __init__(self, messages):
             self.messages = messages
 

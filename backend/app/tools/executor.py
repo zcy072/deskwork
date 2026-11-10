@@ -1,14 +1,18 @@
-import asyncio
-import shutil
 from collections import OrderedDict
 from contextlib import suppress
 from pathlib import Path
 
+from app.runtime.sessions import file_io
 from app.sandbox import CONTAINER_MANAGER
 from app.sandbox.bash_handler import BashSession
 from app.sandbox.errors import ContainerFileSystemError
 from app.services.deliverable_check import check_deliverable
-from app.services.file_versions import archive_previous, digest_file, finish_archive
+from app.services.file_versions import (
+    archive_previous,
+    copy_file_atomic,
+    digest_file,
+    finish_archive,
+)
 from app.tools.retry import retry_transient
 
 # 未显式给 max_chars 时的输出上限。须容得下完整 SKILL.md(约 20KB + 行号)。
@@ -105,7 +109,7 @@ async def _view_container_path_content(
 
     content = await session.read_container_file(container_path)
     limit = DEFAULT_VIEW_MAX_CHARS if max_chars is None else max_chars
-    return await asyncio.to_thread(_render_view, content, view_range, limit)
+    return await file_io(_render_view, content, view_range, limit)
 
 
 def _render_view(content: str, view_range: list[int] | None, limit: int) -> str:
@@ -121,9 +125,10 @@ async def create_container_file(
 ) -> str:
     """Create a file in the file system."""
     session = await CONTAINER_MANAGER.get_or_create(session_id)
-    container_path = session.resolve_container_path(path)
-    await session.create_container_file(container_path, file_text)
-    return f"Successfully created {_relative_session_path(session, container_path)}."
+    async with session.workspace_lock:
+        container_path = session.resolve_container_path(path)
+        await session.create_container_file(container_path, file_text)
+        return f"Successfully created {_relative_session_path(session, container_path)}."
 
 
 async def str_replace_in_container_file(
@@ -134,24 +139,24 @@ async def str_replace_in_container_file(
 ) -> str:
     """Replace a string in a file in the file system."""
     session, container_path, relative_path = await _resolve_existing_file(session_id, path)
+    async with session.workspace_lock:
+        content = await _read_text_for_edit(session, container_path, relative_path)
+        count = content.count(old_string)
+        if count == 0:
+            raise ContainerFileSystemError(
+                "No match found for replacement. Please check your text and try again."
+            )
+        if count > 1:
+            raise ContainerFileSystemError(
+                f"Found {count} matches for replacement text. "
+                "Please provide more context to make a unique match."
+            )
 
-    content = await _read_text_for_edit(session, container_path, relative_path)
-    count = content.count(old_string)
-    if count == 0:
-        raise ContainerFileSystemError(
-            "No match found for replacement. Please check your text and try again."
+        await session.write_container_file(
+            container_path,
+            content.replace(old_string, new_string, 1),
         )
-    if count > 1:
-        raise ContainerFileSystemError(
-            f"Found {count} matches for replacement text. "
-            "Please provide more context to make a unique match."
-        )
-
-    await session.write_container_file(
-        container_path,
-        content.replace(old_string, new_string, 1),
-    )
-    return f"Successfully replaced text in {relative_path}."
+        return f"Successfully replaced text in {relative_path}."
 
 
 async def insert_in_container_file(
@@ -162,27 +167,27 @@ async def insert_in_container_file(
 ) -> str:
     """Insert text into a file at a specific line."""
     session, container_path, relative_path = await _resolve_existing_file(session_id, path)
+    async with session.workspace_lock:
+        if insert_line < 0:
+            raise ContainerFileSystemError("insert_line must be >= 0")
 
-    if insert_line < 0:
-        raise ContainerFileSystemError("insert_line must be >= 0")
+        content = await _read_text_for_edit(session, container_path, relative_path)
+        lines = _split_lines(content)
+        text_lines = _split_lines(insert_text)
 
-    content = await _read_text_for_edit(session, container_path, relative_path)
-    lines = _split_lines(content)
-    text_lines = _split_lines(insert_text)
+        if insert_line == 0:
+            new_lines = text_lines + lines
+        elif insert_line > len(lines):
+            raise ContainerFileSystemError(
+                f"insert_line {insert_line} is beyond the end of the file ({len(lines)} lines)"
+            )
+        else:
+            new_lines = lines[:insert_line] + text_lines + lines[insert_line:]
 
-    if insert_line == 0:
-        new_lines = text_lines + lines
-    elif insert_line > len(lines):
-        raise ContainerFileSystemError(
-            f"insert_line {insert_line} is beyond the end of the file ({len(lines)} lines)"
-        )
-    else:
-        new_lines = lines[:insert_line] + text_lines + lines[insert_line:]
-
-    newline = "\r\n" if "\r\n" in content else "\n"  # 保持原文件的换行风格
-    new_content = newline.join(new_lines) + (newline if content.endswith("\n") else "")
-    await session.write_container_file(container_path, new_content)
-    return f"Successfully inserted text after line {insert_line}."
+        newline = "\r\n" if "\r\n" in content else "\n"  # 保持原文件的换行风格
+        new_content = newline.join(new_lines) + (newline if content.endswith("\n") else "")
+        await session.write_container_file(container_path, new_content)
+        return f"Successfully inserted text after line {insert_line}."
 
 
 def _apply_view_range(
@@ -233,43 +238,46 @@ async def _present_container_files(
 ) -> tuple[str, list[dict[str, str | int]]]:
     """Copy container files to host output/ and return metadata records."""
     session = await CONTAINER_MANAGER.get_or_create(session_id)
-    records: list[dict[str, str | int]] = []
-    messages: list[str] = []
+    async with session.workspace_lock:
+        records: list[dict[str, str | int]] = []
+        messages: list[str] = []
 
-    for raw_path in paths:
-        virtual_path = session.resolve_virtual_path(raw_path)
-        container_path = session.paths.virtual_to_container_path(virtual_path)
-        if not await session.is_file(container_path):
-            relative_path = _relative_session_path(session, container_path)
-            raise ContainerFileSystemError(f"File not found: {relative_path}")
+        for raw_path in paths:
+            virtual_path = session.resolve_virtual_path(raw_path)
+            container_path = session.paths.virtual_to_container_path(virtual_path)
+            if not await session.is_file(container_path):
+                relative_path = _relative_session_path(session, container_path)
+                raise ContainerFileSystemError(f"File not found: {relative_path}")
 
-        file_name = Path(container_path).name
-        host_dest = session.paths.output / file_name
-        warning = await _validate_source(session, virtual_path, session_id, file_name)
-        # output/ 对 agent 可写,目标若是它预先建好的符号链接,后端会顺着它写到沙箱外
-        # 归档和复制可能涉及几十 MB 的读写与比对,都放到线程里,不卡住其他会话的事件流
-        archived = await asyncio.to_thread(_prepare_dest, session.paths, host_dest)
-        try:
-            host_src = session.paths.virtual_to_host_path(virtual_path)
-        except ValueError:
-            host_src = None
-        if host_src is None or not await asyncio.to_thread(_copy_local, host_src, host_dest):
-            await session.copy_to_host(container_path, host_dest)
-        await asyncio.to_thread(finish_archive, session.paths, host_dest, archived)
-        # 文件已复制到 output/;记录必须指向这份副本,下载接口只放行 uploads/ 和 output/
-        record = {
-            "file_name": file_name,
-            "host_path": str(host_dest),
-            "container_path": f"{session.paths.virtual_root.rstrip('/')}/output/{file_name}",
-        }
-        # 摘要让历史消息能找回这次交付的内容,而不是之后被覆盖的最新版
-        with suppress(OSError):
-            record["sha256"], size = await asyncio.to_thread(digest_file, host_dest)
-            record["size"] = size
-        records.append(record)
-        messages.append(f"Presented {file_name}" + (f"\n{warning}" if warning else ""))
+            file_name = Path(container_path).name
+            host_dest = session.paths.output / file_name
+            warning = await _validate_source(session, virtual_path, session_id, file_name)
+            # output/ 对 agent 可写,目标若是它预先建好的符号链接,后端会顺着它写到沙箱外
+            # 归档和复制可能涉及几十 MB 的读写与比对,都放到线程里,不卡住其他会话的事件流
+            archived = await file_io(_prepare_dest, session.paths, host_dest)
+            try:
+                host_src = session.paths.virtual_to_host_path(virtual_path)
+            except ValueError:
+                host_src = None
+            if host_src is None or not await file_io(_copy_local, host_src, host_dest):
+                await session.copy_to_host(container_path, host_dest)
+            retained = await file_io(finish_archive, session.paths, host_dest, archived)
+            if not retained:
+                warning = (warning + "\n历史版本未保留,请及时下载本次文件。").strip()
+            # 文件已复制到 output/;记录必须指向这份副本,下载接口只放行 uploads/ 和 output/
+            record = {
+                "file_name": file_name,
+                "host_path": str(host_dest),
+                "container_path": f"{session.paths.virtual_root.rstrip('/')}/output/{file_name}",
+            }
+            # 摘要让历史消息能找回这次交付的内容,而不是之后被覆盖的最新版
+            with suppress(OSError):
+                record["sha256"], size = await file_io(digest_file, host_dest)
+                record["size"] = size
+            records.append(record)
+            messages.append(f"Presented {file_name}" + (f"\n{warning}" if warning else ""))
 
-    return "\n".join(messages), records
+        return "\n".join(messages), records
 
 
 def _prepare_dest(paths, host_dest: Path):
@@ -284,7 +292,7 @@ def _copy_local(host_src: Path, host_dest: Path) -> bool:
         return False
     if host_src.resolve() != host_dest.resolve():
         host_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(host_src, host_dest)
+        copy_file_atomic(host_src, host_dest)
     return True
 
 
@@ -303,7 +311,7 @@ async def _validate_source(session, virtual_path: str, session_id: str, file_nam
         return ""
     if not host_src.is_file() or host_src.is_symlink():
         return ""
-    problem = await asyncio.to_thread(check_deliverable, host_src)
+    problem = await file_io(check_deliverable, host_src)
     key = (session_id, file_name)
     if problem is None:
         _check_failures.pop(key, None)

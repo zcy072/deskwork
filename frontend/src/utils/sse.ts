@@ -6,7 +6,14 @@ export function toPacket(v: unknown): StreamPacket | null {
   const o = v as Record<string, unknown>
   if (typeof o.event !== 'string') return null
   const data = typeof o.data === 'object' && o.data !== null && !Array.isArray(o.data) ? (o.data as Record<string, any>) : {}
-  return typeof o.id === 'string' ? { id: o.id, event: o.event, data } : { event: o.event, data }
+  const packet: StreamPacket = { event: o.event, data }
+  if (typeof o.id === 'string') packet.id = o.id
+  if (typeof o.run_id === 'string' && o.run_id) packet.run_id = o.run_id
+  if (typeof o.seq === 'number' && Number.isSafeInteger(o.seq) && o.seq > 0) packet.seq = o.seq
+  if (typeof o.schema_version === 'number' && Number.isSafeInteger(o.schema_version) && o.schema_version > 0) {
+    packet.schema_version = o.schema_version
+  }
+  return packet
 }
 
 /** 把累积的文本按行切开,返回解析出的事件和尚未结束的残余文本。 */

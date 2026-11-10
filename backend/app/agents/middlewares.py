@@ -16,6 +16,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command, interrupt
 
 from app.agents.boundary import BUILTIN_UNTRUSTED_TOOLS, wrap_result
+from app.agents.context import RunContext
 from app.agents.llms import get_fallback_models, get_model
 from app.agents.messages import is_user_message
 from app.agents.permissions import policy_for
@@ -25,10 +26,11 @@ from app.agents.skills_helper import get_skills_xml
 from app.config import settings
 from app.db import is_db_ready, repository
 from app.owner import current_owner
+from app.services.budget import BudgetExceeded
 from app.services.mcp_client import confirm_tool_names, mcp_tool_names
 from app.services.memory import INJECT_LIMIT, format_for_prompt, select_memories
 from app.services.web_access import FETCH_TOOL, known_urls, url_key
-from app.utils import logger
+from app.utils import get_trace_id, logger
 
 
 class _SummaryFailed(Exception):
@@ -87,6 +89,8 @@ class SafeSummarizationMiddleware(SummarizationMiddleware):
         for model in [self.model, *self.fallbacks]:
             try:
                 return model.invoke(prompt, config=_SUMMARY_CONFIG).text.strip()
+            except BudgetExceeded:
+                raise
             except Exception:
                 logger.warning("Summary generation failed", exc_info=True)
         raise _SummaryFailed
@@ -100,6 +104,8 @@ class SafeSummarizationMiddleware(SummarizationMiddleware):
         for model in [self.model, *self.fallbacks]:
             try:
                 return (await model.ainvoke(prompt, config=_SUMMARY_CONFIG)).text.strip()
+            except BudgetExceeded:
+                raise
             except Exception:
                 logger.warning("Summary generation failed", exc_info=True)
         raise _SummaryFailed
@@ -264,14 +270,16 @@ class ToolGuardMiddleware(AgentMiddleware):
             ):
                 return wrap_result(result, name)
             return result
+        except BudgetExceeded:
+            raise
         except GraphBubbleUp:
             # interrupt() 等控制流信号,不是工具失败
             raise
-        except Exception as exc:
+        except Exception:
             # 多数工具自己把错误转成结果;漏出来的(MCP 连接断开、数据库错误等)也交给模型处理,
             # 不中断整轮,前端的工具卡片也能收到结果而不是一直转圈
             logger.exception("Tool %s failed", request.tool_call["name"])
-            failed = _refusal(request, f"Error: {type(exc).__name__}: {exc}")
+            failed = _refusal(request, f"工具执行失败,请稍后重试(trace id: {get_trace_id()})")
             self._emit(request, failed)
             return failed
 
@@ -293,6 +301,8 @@ class LoggingModelFallbackMiddleware(ModelFallbackMiddleware):
     ) -> ModelResponse:
         try:
             return await handler(request)
+        except BudgetExceeded:
+            raise
         except Exception as exc:
             last: Exception = exc
             logger.warning("主模型调用失败,尝试备用模型: %s: %s", type(exc).__name__, exc)
@@ -302,6 +312,8 @@ class LoggingModelFallbackMiddleware(ModelFallbackMiddleware):
                 response = await handler(request.override(model=model))
                 logger.warning("已切换到备用模型 %s", name)
                 return response
+            except BudgetExceeded:
+                raise
             except Exception as exc:
                 last = exc
                 logger.warning("备用模型 %s 也失败: %s: %s", name, type(exc).__name__, exc)
@@ -328,7 +340,8 @@ class MemoryMiddleware(AgentMiddleware):
         self._turn_cache: OrderedDict[tuple[str, str], str] = OrderedDict()
 
     async def _addendum(self, request: ModelRequest) -> str:
-        owner = current_owner.get()
+        context = getattr(request.runtime, "context", None)
+        owner = context.owner if isinstance(context, RunContext) else current_owner.get()
         last_human = next((m for m in reversed(request.messages) if is_user_message(m)), None)
         key = (owner, last_human.id) if last_human is not None and last_human.id else None
         if key is not None and key in self._turn_cache:

@@ -28,6 +28,9 @@ function toChatMessage(m: MessageRow): ChatMessage {
     id: String(m.id),
     role: m.role,
     parts: m.parts,
+    runId: m.prompt_id,
+    lastEventSeq: m.last_event_seq,
+    errorText: m.error_text ?? undefined,
     status: m.status,
     dbId: m.role === 'user' ? m.id : undefined,
     rewindable: m.rewindable,
@@ -107,6 +110,8 @@ export const useChatStore = defineStore('chat', () => {
     pendingDrafts.clear()
   }
   let abort: AbortController | null = null
+  // 历史读取期间即使新一轮已经开始并结束,旧响应也不能覆盖它。
+  let runSeq = 0
   let stopTimer: ReturnType<typeof setTimeout> | null = null
   /** 已切走、但服务端仍在生成的会话 id;当前会话的运行状态看 running */
   const backgroundIds = ref<string[]>([])
@@ -324,11 +329,16 @@ export const useChatStore = defineStore('chat', () => {
       loadingConversation.value = false // 接回事件流可能持续很久,转圈只覆盖加载历史这一段
       // 文件是否已删除要对照会话摘要里的文件,摘要到了再查
       void refreshUsage().then(syncMissingFiles)
-      // 先取消息再查状态:状态仍是 running 就说明助手消息还没落库,接回事件流不会重复
+      // 历史可能是运行中的快照;状态查询时若已结束,还要补读最终历史。
       const active = await api.getThreadStatus(id).catch(() => null)
       if (mine !== openSeq || running.value) return
       if (active?.status === 'running' && active.prompt_id) await attach(active.prompt_id)
-      else if (active) unmarkBackground(id)
+      else if (active) {
+        await reloadMessages(id)
+        if (mine !== openSeq || running.value) return
+        unmarkBackground(id)
+        void refreshUsage().then(syncMissingFiles)
+      }
     } catch (e) {
       if (mine === openSeq) error.value = errMsg(e)
     } finally {
@@ -341,10 +351,22 @@ export const useChatStore = defineStore('chat', () => {
     const turn = newTurn()
     turn.parts = live.parts
     for await (const packet of api.streamEvents(sid, promptId, signal)) {
+      if (packet.run_id && packet.run_id !== promptId) continue
+      const input = packet.event === 'user.message' ? packet.data :
+        packet.event === 'run.snapshot' ? packet.data.input : null
+      if (input && sid === sessionId.value && !messages.value.some((m) => m.role === 'user' && m.runId === promptId)) {
+        const at = messages.value.indexOf(live)
+        if (at >= 0) messages.value.splice(at, 0, {
+          id: newId(), role: 'user', runId: promptId,
+          parts: input.text ? [{ type: 'text', text: input.text }] : [],
+          attachmentFiles: input.files ?? [],
+        })
+      }
       applyPacket(turn, packet)
+      live.parts = turn.parts
       if (turn.error && sid === sessionId.value) error.value = turn.error
     }
-    live.status = turn.error ? 'error' : cancelling.value || signal.aborted ? 'cancelled' : 'completed'
+    live.status = turn.error ? 'error' : turn.status ?? (cancelling.value || signal.aborted ? 'cancelled' : 'completed')
     live.errorText = turn.error ?? undefined
     live.warningText = turn.warning ?? undefined
   }
@@ -371,12 +393,14 @@ export const useChatStore = defineStore('chat', () => {
 
   /** 打开一个仍在生成的会话:补一条空的助手消息并接上事件流。 */
   async function attach(promptId: string) {
+    runSeq++
     running.value = true
     unmarkBackground(sessionId.value)
     // 生成中途已落库的部分内容会随事件流从头回放,先丢掉避免重复
     const last = messages.value[messages.value.length - 1]
-    if (last?.role === 'assistant' && last.status === 'running') messages.value.pop()
-    messages.value.push({ id: newId(), role: 'assistant', parts: [] })
+    messages.value = messages.value.filter((m) => !(m.role === 'assistant' && m.runId === promptId))
+    if (last?.role === 'assistant' && !last.runId && last.status === 'running') messages.value.pop()
+    messages.value.push({ id: newId(), role: 'assistant', runId: promptId, parts: [] })
     const live = messages.value[messages.value.length - 1]
     const sid = sessionId.value
     const mine = (abort = new AbortController())
@@ -464,9 +488,11 @@ export const useChatStore = defineStore('chat', () => {
   /** 用服务端的消息替换本地列表(仅在没有进行中的生成、且仍停留在该会话时)。 */
   async function reloadMessages(id: string) {
     if (running.value) return
+    const mine = openSeq
+    const runAtRead = runSeq
     const keep = Math.max(MESSAGE_PAGE_SIZE, messages.value.length)
     const rows = await api.getMessages(id, keep)
-    if (id !== sessionId.value || running.value) return
+    if (mine !== openSeq || runAtRead !== runSeq || id !== sessionId.value || running.value) return
     messages.value = rows.map(toChatMessage)
     hasEarlier.value = rows.length >= keep
   }
@@ -545,41 +571,14 @@ export const useChatStore = defineStore('chat', () => {
     await refreshConversations()
   }
 
-  /** 会话正在生成时返回当前 prompt_id;查询失败或没有进行中的生成返回 null。 */
-  async function findRunningPrompt(sid: string): Promise<string | null> {
-    try {
-      const st = await api.getThreadStatus(sid)
-      return st?.status === 'running' && st.prompt_id ? st.prompt_id : null
-    } catch {
-      return null
-    }
-  }
-
-  /**
-   * 发送时网络出错、线程也不在运行:服务端可能已接受并且已经跑完。
-   * 最近一条用户消息比发送前已知的都新、文字也相同,就算已接受。查不到时按未接受处理。
-   */
-  async function serverRecordedTurn(sid: string, before: ChatMessage[], text: string): Promise<boolean> {
-    let known = 0
-    for (const m of before) known = Math.max(known, m.dbId ?? 0, /^\d+$/.test(m.id) ? Number(m.id) : 0)
-    try {
-      const rows = await api.getMessages(sid, MESSAGE_PAGE_SIZE)
-      const last = [...rows].reverse().find((r) => r.role === 'user')
-      if (!last || last.id <= known) return false
-      const sent = last.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')
-      return sent === text
-    } catch {
-      return false
-    }
-  }
-
   /**
    * 发送消息。rewindTo 为某条用户消息的数据库 id 时,先让服务端回退到该消息之前再发送:
    * 本地同步丢弃它及之后的消息,请求失败则还原。
    */
-  async function send(text: string, files: File[], rewindTo?: number): Promise<boolean> {
+  async function send(text: string, files: File[], rewindTo?: number, interruptId?: string): Promise<boolean> {
     if (running.value) return false
     if (rewindTo === undefined && !text.trim() && files.length === 0) return false
+    runSeq++
     error.value = null
     running.value = true
     const snapshot = messages.value.slice()
@@ -619,16 +618,32 @@ export const useChatStore = defineStore('chat', () => {
     try {
       let promptId: string | null
       try {
-        promptId = await api.sendMessage(sid, text, files, rewindTo)
+        try {
+          promptId = interruptId
+            ? await api.sendMessage(sid, text, files, rewindTo, { interruptId })
+            : await api.sendMessage(sid, text, files, rewindTo)
+        } catch (e) {
+          if (e instanceof api.ApiError && e.code === 'files_unavailable' && rewindTo !== undefined &&
+              window.confirm('文件快照已不可用。是否仅回退对话并保留当前文件?')) {
+            promptId = await api.sendMessage(sid, text, files, rewindTo, { conversationOnly: true })
+          } else throw e
+        }
       } catch (e) {
         if (e instanceof api.ApiError) throw e
         // 没拿到响应的网络错误:服务端可能已接受并开始生成,线程在运行就接回那一轮;
         // 已经跑完的,看服务端是否记下了这条消息,记下了就别把文字还给输入框
-        promptId = await findRunningPrompt(sid)
-        if (!promptId && !(await serverRecordedTurn(sid, snapshot, text))) throw e
+        if (!(e instanceof api.SendUncertainError)) throw e
+        const recorded = await api.getAcceptedRun(sid, e.requestId)
+        if (!recorded) throw e
+        promptId = ['preparing', 'running', 'finalizing'].includes(recorded.status) ? recorded.id : null
       }
       accepted = true
-      if (promptId) await consume(sid, promptId, live, mine.signal)
+      if (promptId) {
+        live.runId = promptId
+        const user = messages.value[messages.value.indexOf(live) - 1]
+        if (user?.role === 'user') user.runId = promptId
+        await consume(sid, promptId, live, mine.signal)
+      }
       else finishedElsewhere = true
     } catch (e) {
       if (!mine.signal.aborted && sid === sessionId.value) error.value = errMsg(e)

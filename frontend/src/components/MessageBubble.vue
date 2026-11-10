@@ -126,7 +126,7 @@ watch(
           :kind="it.askKind"
           :options="it.options"
           :active="askActive"
-          @answer="(t) => chat.send(t, [])"
+          @answer="(t) => it.interruptId ? chat.send(t, [], undefined, it.interruptId) : chat.send(t, [])"
         />
         <DeliveredFiles v-else-if="it.kind === 'files'" :files="it.files" />
         <template v-else-if="it.kind === 'widgets'">

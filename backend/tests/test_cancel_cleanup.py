@@ -35,6 +35,7 @@ async def test_second_cancel_during_cleanup_does_not_lose_stream_end(monkeypatch
     async def persist(*_a, **_k):
         in_cleanup.set()
         await asyncio.sleep(0.2)  # 落库较慢,给第二次 cancel 留窗口
+        return True
 
     async def noop(*_a, **_k):
         return None
@@ -55,5 +56,5 @@ async def test_second_cancel_during_cleanup_does_not_lose_stream_end(monkeypatch
         await task
     except asyncio.CancelledError:
         pass
-    assert "stream.end" in events and status == ["complete"]
-    assert "p" not in ops._started_prompts
+    assert "stream.end" in events and status == ["cancelled"]
+    assert ops.sessions.get("s") is None

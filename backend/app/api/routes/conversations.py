@@ -13,17 +13,19 @@ from app.agents.checkpointers import get_checkpointer
 from app.api.security import get_owner, rate_limit_default, require_api_key
 from app.config import settings
 from app.db import repository
+from app.db import runs as run_store
+from app.runtime.sessions import complete_before_cancelling, file_io, sessions
 from app.sandbox import CONTAINER_MANAGER
 from app.sandbox.session_paths import SessionPaths
 from app.schemas import SESSION_ID_PATTERN
 from app.services import session_export, session_import
 from app.services.chat_operations import ActiveRunError
 from app.services.checkpoint_transfer import CheckpointRejected, import_thread
-from app.services.conversation_cleanup import delete_conversation_data
+from app.services.conversation_cleanup import delete_conversation_data, discard_uncommitted_import
 from app.services.mcp_client import mcp_status
 from app.services.memory import MEMORY_MAX_CHARS, MemoryRejected, save_memory
 from app.services.usage import aggregate_usage
-from app.utils import get_thread_statuses, logger
+from app.utils import logger
 
 conversations_router = APIRouter(
     prefix="/conversations",
@@ -58,7 +60,7 @@ async def list_conversations(
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
     rows = await repository.list_conversations(limit, offset, get_owner(request))
-    live = await _live_running([c.id for c, _ in rows])
+    states = await _current_states([c.id for c, _ in rows])
     return [
         {
             "id": c.id,
@@ -67,21 +69,27 @@ async def list_conversations(
             "created_at": _iso(c.created_at),
             "updated_at": _iso(c.updated_at),
             # 运行中以 Redis 为准(进程崩溃不会在库里留下假的 running);否则取库里记的最近终态
-            "status": "running" if running else c.last_run_status,
-            "unread": bool(c.unread) and not running,
+            "status": "running"
+            if states.get(c.id) in run_store.ACTIVE_STATUSES
+            else states.get(c.id, c.last_run_status),
+            "unread": bool(c.unread) and states.get(c.id) not in run_store.ACTIVE_STATUSES,
         }
-        for (c, n), running in zip(rows, live, strict=True)
+        for c, n in rows
     ]
 
 
-async def _live_running(conversation_ids: list[str]) -> list[bool]:
+async def _current_states(conversation_ids: list[str]) -> dict[str, str]:
     """Redis 不可用时当作没有在运行,列表仍能返回库里的状态。"""
     try:
-        statuses = await get_thread_statuses(conversation_ids)
+        states = await run_store.latest_statuses(conversation_ids)
+        for sid in conversation_ids:
+            handle = sessions.get(sid)
+            if handle and handle.operation == "run":
+                states[sid] = "error" if handle.phase == "recovery_required" else "running"
+        return states
     except Exception:
         logger.warning("Reading thread statuses for the conversation list failed")
-        return [False] * len(conversation_ids)
-    return [s == "running" for s in statuses]
+        return {}
 
 
 @conversations_router.get("/search")
@@ -115,11 +123,11 @@ async def _spool_upload(file: UploadFile) -> Path:
     size = 0
     try:
         with dest.open("wb") as out:
-            while chunk := await file.read(IMPORT_CHUNK):
+            while chunk := await file_io(file.file.read, IMPORT_CHUNK):
                 size += len(chunk)
                 if size > session_import.MAX_ARCHIVE_BYTES:
                     raise HTTPException(status_code=413, detail="备份包过大")
-                await asyncio.to_thread(out.write, chunk)
+                await file_io(out.write, chunk)
     except BaseException:
         dest.unlink(missing_ok=True)
         raise
@@ -130,37 +138,60 @@ async def _spool_upload(file: UploadFile) -> Path:
 async def import_conversation(request: Request, file: Annotated[UploadFile, File()]):
     """把备份包导入为一个新会话(新 id),不会覆盖已有会话。"""
     owner = get_owner(request)
-    archive = await _spool_upload(file)
     new_id = str(uuid.uuid4())
-    paths = SessionPaths.create(new_id)
-    checkpointer = get_checkpointer()
-    wrote_checkpoint = False
     try:
-        try:
-            plan = await asyncio.to_thread(session_import.inspect_archive, archive)
-            if plan.checkpoint is not None and not isinstance(checkpointer, AsyncSqliteSaver):
-                plan.checkpoint = None
-                for m in plan.messages:
-                    m["checkpoint_id"] = None
-                plan.warnings.append("当前服务没有持久化 checkpoint,只导入了消息和文件")
-            await CONTAINER_MANAGER.get_or_create(new_id)
-            await asyncio.to_thread(session_import.extract_files, archive, plan, paths)
-            if plan.checkpoint is not None:
-                wrote_checkpoint = True
-                await import_thread(checkpointer, new_id, plan.checkpoint)
-            await repository.import_conversation(
-                new_id,
-                owner,
-                title=plan.title,
-                created_at=plan.created_at,
-                updated_at=plan.updated_at,
-                messages=plan.messages,
-            )
-        except BaseException:
-            await _discard_import(new_id, checkpointer, wrote_checkpoint)
-            raise
+        # Include upload spooling, IO and rollback in shutdown's operation gate.
+        with sessions.operation(new_id, "import"):
+            return await _import_conversation(file, new_id, owner)
+    except ActiveRunError as exc:
+        raise HTTPException(status_code=409, detail="服务正在关闭,请稍后导入") from exc
     except (session_import.ImportRejected, CheckpointRejected) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def _import_conversation(file: UploadFile, new_id: str, owner: str) -> dict:
+    archive = await _spool_upload(file)
+    wrote_checkpoint = False
+    try:
+        paths = SessionPaths.create(new_id)
+        checkpointer = get_checkpointer()
+        plan = await file_io(session_import.inspect_archive, archive)
+        if plan.checkpoint is not None and not isinstance(checkpointer, AsyncSqliteSaver):
+            plan.checkpoint = None
+            for m in plan.messages:
+                m["checkpoint_id"] = None
+            plan.warnings.append("当前服务没有持久化 checkpoint,只导入了消息和文件")
+        await complete_before_cancelling(
+            asyncio.create_task(CONTAINER_MANAGER.get_or_create(new_id))
+        )
+        await file_io(session_import.extract_files, archive, plan, paths)
+        if plan.checkpoint is not None:
+            wrote_checkpoint = True
+            await complete_before_cancelling(
+                asyncio.create_task(import_thread(checkpointer, new_id, plan.checkpoint))
+            )
+        # COMMIT may finish after its waiter is cancelled. Settle the whole
+        # transaction before the cleanup task checks the durable receipt.
+        await complete_before_cancelling(
+            asyncio.create_task(
+                repository.import_conversation(
+                    new_id,
+                    owner,
+                    title=plan.title,
+                    created_at=plan.created_at,
+                    updated_at=plan.updated_at,
+                    messages=plan.messages,
+                    graph_checkpoint_id=plan.graph_checkpoint_id
+                    if plan.checkpoint is not None
+                    else None,
+                )
+            )
+        )
+    except BaseException:
+        await complete_before_cancelling(
+            asyncio.create_task(discard_uncommitted_import(new_id, wrote_checkpoint))
+        )
+        raise
     finally:
         archive.unlink(missing_ok=True)
     return {
@@ -172,19 +203,6 @@ async def import_conversation(request: Request, file: Annotated[UploadFile, File
         "resumable": plan.checkpoint is not None,
         "warnings": plan.warnings,
     }
-
-
-async def _discard_import(session_id: str, checkpointer, wrote_checkpoint: bool) -> None:
-    """导入中途失败,把已写的文件和 checkpoint 清掉,不留半个会话。"""
-    if wrote_checkpoint:
-        try:
-            await checkpointer.adelete_thread(session_id)
-        except Exception:
-            logger.exception("Failed to roll back checkpoints of import %s", session_id)
-    try:
-        await CONTAINER_MANAGER.purge_session(session_id)
-    except Exception:
-        logger.exception("Failed to roll back sandbox files of import %s", session_id)
 
 
 @conversations_router.get("/{conversation_id}/messages")
@@ -208,6 +226,7 @@ async def get_messages(
     if messages is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     files = await repository.get_files_for_messages([m.id for m in messages if m.role == "user"])
+    run_records = await run_store.for_messages([m.prompt_id for m in messages], conversation_id)
     return [
         {
             "id": m.id,
@@ -216,12 +235,28 @@ async def get_messages(
             "content": m.content,
             "parts": repository.normalize_delivered_parts(m.parts),
             "status": m.status,
+            "last_event_seq": m.last_event_seq or 0,
+            "error_text": run_records[m.prompt_id].public_error
+            if m.prompt_id in run_records
+            else None,
             "rewindable": m.role == "user" and m.checkpoint_id is not None,
             "created_at": _iso(m.created_at),
             **({"attachments": files.get(m.id, [])} if m.role == "user" else {}),
         }
         for m in messages
     ]
+
+
+@conversations_router.get("/{conversation_id}/requests/{request_id}")
+async def accepted_request(
+    request: Request,
+    conversation_id: ConversationId,
+    request_id: Annotated[str, PathParam(max_length=64)],
+):
+    run = await run_store.by_request(conversation_id, request_id, get_owner(request))
+    if run is None:
+        raise HTTPException(404, "Accepted request not found")
+    return {"id": run.id, "status": run.status}
 
 
 @conversations_router.get("/{conversation_id}/assets")

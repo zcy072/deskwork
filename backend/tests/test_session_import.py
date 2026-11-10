@@ -1,25 +1,32 @@
 """备份包的 checkpoint 往返、导入校验(路径、sha256、白名单)与 /conversations/import。"""
 
+import asyncio
 import io
 import json
 import sqlite3
+import threading
 import zipfile
 
 import aiosqlite
 import ormsgpack
 import pytest
+from fastapi import HTTPException, UploadFile
 from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from starlette.requests import Request
 
 from app import app
 from app.agents import checkpointers
 from app.api.routes import conversations
 from app.config import settings
 from app.db import close_db, init_db, repository
+from app.runtime.sessions import ActiveRunError, sessions
 from app.sandbox.session_paths import SessionPaths
+from app.services import chat_operations as ops
 from app.services import checkpoint_transfer as ct
+from app.services import conversation_cleanup as cleanup
 from app.services import session_export, session_import
 from app.services.history import TurnRecorder, persist_assistant_turn, persist_user_turn
 
@@ -365,6 +372,8 @@ async def env(db, tmp_path, saver, monkeypatch):
     root = tmp_path / "sessions"
     mgr = FakeManager(root)
     monkeypatch.setattr(conversations, "CONTAINER_MANAGER", mgr)
+    monkeypatch.setattr(cleanup, "CONTAINER_MANAGER", mgr)
+    monkeypatch.setattr(cleanup, "PENDING_PURGE_DIR", tmp_path / "pending_purge")
     original = SessionPaths.create.__func__
     monkeypatch.setattr(
         SessionPaths, "create", classmethod(lambda cls, sid, *a, **k: original(cls, sid, root))
@@ -448,3 +457,342 @@ async def test_import_without_persistent_saver_keeps_messages(env, tmp_path, mon
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         r = await c.post("/conversations/import", files={"file": ("b.zip", arc.read_bytes())})
     assert r.status_code == 201 and r.json()["resumable"] is False
+
+
+async def _import_archive(archive):
+    upload = UploadFile(file=io.BytesIO(archive.read_bytes()), filename="backup.zip")
+    try:
+        return await conversations.import_conversation(
+            Request({"type": "http", "state": {}}), upload
+        )
+    finally:
+        await upload.close()
+
+
+async def _with_checkpoint(tmp_path, saver):
+    await _put(saver, "original")
+    return _archive(tmp_path, checkpoint=await ct.export_thread(saver, "original"))
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, RuntimeError])
+async def test_import_failure_reconciles_durable_commit(
+    env, tmp_path, monkeypatch, committed, failure
+):
+    mgr, root, saver = env
+    archive = await _with_checkpoint(tmp_path, saver)
+    commit = repository.import_conversation
+    imported = []
+
+    async def failing_commit(sid, *args, **kwargs):
+        imported.append(sid)
+        if committed:
+            await commit(sid, *args, **kwargs)
+        raise failure("interrupted commit response")
+
+    monkeypatch.setattr(repository, "import_conversation", failing_commit)
+    with pytest.raises(failure):
+        await _import_archive(archive)
+    sid = imported[0]
+    assert (await repository.get_conversation(sid) is not None) == committed
+    checkpoint = await saver.aget_tuple({"configurable": {"thread_id": sid}})
+    assert (checkpoint is not None) == committed
+    assert (root / sid / "uploads" / "a.txt").exists() == committed
+    assert (sid in mgr.purged) != committed
+    assert not list(cleanup.PENDING_PURGE_DIR.iterdir())
+    assert sessions.get(sid) is None
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+async def test_cancelled_commit_waiter_settles_before_releasing_gate(
+    env, tmp_path, monkeypatch, after_commit
+):
+    mgr, root, saver = env
+    archive = await _with_checkpoint(tmp_path, saver)
+    commit = repository.import_conversation
+    entered, finish = asyncio.Event(), asyncio.Event()
+    imported = []
+
+    async def slow_commit(sid, *args, **kwargs):
+        imported.append(sid)
+        if after_commit:
+            await commit(sid, *args, **kwargs)
+        entered.set()
+        await finish.wait()
+        if not after_commit:
+            await commit(sid, *args, **kwargs)
+
+    monkeypatch.setattr(repository, "import_conversation", slow_commit)
+    task = asyncio.create_task(_import_archive(archive))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        for _ in range(2):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done() and not mgr.purged
+            with pytest.raises(ActiveRunError):
+                sessions.reserve(imported[0])
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    sid = imported[0]
+    assert await repository.get_conversation(sid) is not None
+    assert (root / sid / "uploads" / "a.txt").read_bytes() == b"hello"
+    assert await saver.aget_tuple({"configurable": {"thread_id": sid}})
+    assert not mgr.purged and sessions.get(sid) is None
+
+
+async def test_cancelled_extraction_drains_thread_and_shutdown_waits(env, tmp_path, monkeypatch):
+    mgr, root, _ = env
+    archive = _archive(
+        tmp_path, files={"output/first.txt": b"first", "output/nested/late.txt": b"late"}
+    )
+    entered, resume, finished = threading.Event(), threading.Event(), threading.Event()
+    make_dir, extract = session_import._make_dir, session_import.extract_files
+
+    def delayed_dir(path, mode):
+        if path.name == "nested":
+            entered.set()
+            assert resume.wait(5)
+        make_dir(path, mode)
+
+    def watched_extract(*args):
+        try:
+            extract(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(session_import, "_make_dir", delayed_dir)
+    monkeypatch.setattr(session_import, "extract_files", watched_extract)
+    task = asyncio.create_task(_import_archive(archive))
+    shutdown = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        for _ in range(2):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done() and not mgr.purged and not finished.is_set()
+        shutdown = asyncio.create_task(ops.shutdown_runs())
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+    finally:
+        resume.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    if shutdown:
+        await asyncio.wait_for(shutdown, 2)
+    assert finished.is_set() and mgr.purged
+    assert not list(root.iterdir()) and not sessions.active()
+    assert await repository.list_conversations() == []
+
+
+async def test_shutdown_tracks_import_from_upload_spooling(env, tmp_path, monkeypatch):
+    archive = _archive(tmp_path)
+    entered, finish = asyncio.Event(), asyncio.Event()
+    spool = conversations._spool_upload
+
+    async def slow_spool(file):
+        entered.set()
+        await finish.wait()
+        return await spool(file)
+
+    monkeypatch.setattr(conversations, "_spool_upload", slow_spool)
+    task = asyncio.create_task(_import_archive(archive))
+    await asyncio.wait_for(entered.wait(), 2)
+    shutdown = asyncio.create_task(ops.shutdown_runs())
+    await asyncio.sleep(0)
+    try:
+        assert not shutdown.done()
+        with pytest.raises(HTTPException) as exc:
+            await _import_archive(archive)
+        assert exc.value.status_code == 409
+    finally:
+        finish.set()
+    result = await asyncio.wait_for(task, 2)
+    await asyncio.wait_for(shutdown, 2)
+    assert await repository.get_conversation(result["id"]) is not None
+    assert not sessions.active()
+
+
+@pytest.mark.parametrize("committed", [False, True])
+async def test_uncertain_import_preserves_resources_until_startup_reconciliation(
+    env, tmp_path, monkeypatch, committed
+):
+    mgr, root, saver = env
+    archive = await _with_checkpoint(tmp_path, saver)
+    commit, get = repository.import_conversation, repository.get_conversation
+    imported = []
+
+    async def uncertain_commit(sid, *args, **kwargs):
+        imported.append(sid)
+        if committed:
+            await commit(sid, *args, **kwargs)
+        raise RuntimeError("commit response lost")
+
+    async def unavailable(*args, **kwargs):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(repository, "import_conversation", uncertain_commit)
+    monkeypatch.setattr(repository, "get_conversation", unavailable)
+    with pytest.raises(RuntimeError, match="commit response lost"):
+        await _import_archive(archive)
+    sid = imported[0]
+    assert not mgr.purged
+    assert (root / sid / "uploads" / "a.txt").exists()
+    assert (cleanup.PENDING_PURGE_DIR / sid).exists()
+    monkeypatch.setattr(repository, "get_conversation", get)
+    await cleanup.retry_pending_purges()
+    assert not (cleanup.PENDING_PURGE_DIR / sid).exists()
+    assert (root / sid).exists() == committed
+    assert (await saver.aget_tuple({"configurable": {"thread_id": sid}}) is not None) == committed
+
+
+async def test_failed_import_cleanup_is_retried(env, tmp_path, monkeypatch):
+    mgr, root, saver = env
+    archive = await _with_checkpoint(tmp_path, saver)
+    purge = mgr.purge_session
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(repository, "import_conversation", fail)
+    monkeypatch.setattr(mgr, "purge_session", fail)
+    with pytest.raises(RuntimeError):
+        await _import_archive(archive)
+    markers = list(cleanup.PENDING_PURGE_DIR.iterdir())
+    assert len(markers) == 1
+    sid = markers[0].name
+    assert (root / sid).exists()
+    assert await saver.aget_tuple({"configurable": {"thread_id": sid}}) is None
+    monkeypatch.setattr(mgr, "purge_session", purge)
+    assert await cleanup.retry_pending_purges() == 1
+    assert not (root / sid).exists()
+
+
+async def test_cancel_during_checkpoint_import_drains_then_removes_it(env, tmp_path, monkeypatch):
+    mgr, root, saver = env
+    archive = await _with_checkpoint(tmp_path, saver)
+    original = conversations.import_thread
+    entered, finish = asyncio.Event(), asyncio.Event()
+    imported = []
+
+    async def delayed_checkpoint(checkpointer, sid, parsed):
+        imported.append(sid)
+        entered.set()
+        await finish.wait()
+        await original(checkpointer, sid, parsed)
+
+    monkeypatch.setattr(conversations, "import_thread", delayed_checkpoint)
+    task = asyncio.create_task(_import_archive(archive))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not mgr.purged
+        assert sessions.get(imported[0]) is not None
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    sid = imported[0]
+    assert await repository.get_conversation(sid) is None
+    assert await saver.aget_tuple({"configurable": {"thread_id": sid}}) is None
+    assert not (root / sid).exists() and sessions.get(sid) is None
+
+
+async def test_repeated_cancellation_during_rollback_keeps_gate(env, tmp_path, monkeypatch):
+    mgr, root, saver = env
+    archive = await _with_checkpoint(tmp_path, saver)
+    purge = mgr.purge_session
+    entered, finish = asyncio.Event(), asyncio.Event()
+    imported = []
+
+    async def fail_commit(sid, *args, **kwargs):
+        imported.append(sid)
+        raise asyncio.CancelledError
+
+    async def slow_purge(sid):
+        entered.set()
+        await finish.wait()
+        await purge(sid)
+
+    monkeypatch.setattr(repository, "import_conversation", fail_commit)
+    monkeypatch.setattr(mgr, "purge_session", slow_purge)
+    task = asyncio.create_task(_import_archive(archive))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        for _ in range(2):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            with pytest.raises(ActiveRunError):
+                sessions.reserve(imported[0])
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    assert not (root / imported[0]).exists()
+    assert not list(cleanup.PENDING_PURGE_DIR.iterdir())
+    assert not sessions.active()
+
+
+async def test_conversation_without_graph_survives_export_import(env):
+    mgr, root, _ = env
+    await repository.ensure_conversation("empty", "failed before graph")
+    await persist_user_turn("empty", "unstarted", "question", [])
+    await mgr.get_or_create("empty")
+    (root / "empty" / "output").mkdir()
+    (root / "empty" / "output" / "file.txt").write_text("kept")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        exported = await client.get("/files/export", params={"session_id": "empty"})
+        assert exported.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            assert "checkpoint.json" not in archive.namelist()
+            assert not json.loads(archive.read("manifest.json"))["checkpoint"]["included"]
+        imported = await client.post(
+            "/conversations/import", files={"file": ("backup.zip", exported.content)}
+        )
+        assert imported.status_code == 201, imported.text
+    result = imported.json()
+    assert result["resumable"] is False
+    assert (root / result["id"] / "output" / "file.txt").read_text() == "kept"
+    messages = await repository.get_messages(result["id"])
+    assert messages[0].content == "question" and messages[0].checkpoint_id is None
+
+
+def test_legacy_empty_checkpoint_keeps_messages_and_files(tmp_path):
+    archive = _archive(
+        tmp_path,
+        checkpoint={"payload_version": ct.PAYLOAD_VERSION, "checkpoints": [], "writes": []},
+    )
+    plan = session_import.inspect_archive(archive)
+    assert plan.checkpoint is None and plan.graph_checkpoint_id is None
+    assert len(plan.messages) == 2 and len(plan.files) == 1 and plan.warnings
+    assert all(m["checkpoint_id"] is None for m in plan.messages)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"writes": [{}]},
+        {"writes": None},
+        {"checkpoints": None},
+        {"payload_version": 2},
+        {"unexpected": "field"},
+    ],
+)
+def test_empty_checkpoint_compatibility_does_not_accept_malformed_payload(tmp_path, change):
+    checkpoint = {"payload_version": ct.PAYLOAD_VERSION, "checkpoints": [], "writes": [], **change}
+    with pytest.raises(session_import.ImportRejected):
+        session_import.inspect_archive(_archive(tmp_path, checkpoint=checkpoint))
+
+
+def test_empty_checkpoint_cannot_claim_a_selected_recovery_point(tmp_path):
+    archive = _archive(
+        tmp_path,
+        checkpoint={"payload_version": ct.PAYLOAD_VERSION, "checkpoints": [], "writes": []},
+        document={"messages": [], "graph_checkpoint_id": "missing"},
+    )
+    with pytest.raises(session_import.ImportRejected, match="恢复点"):
+        session_import.inspect_archive(archive)

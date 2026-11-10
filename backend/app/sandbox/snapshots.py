@@ -8,6 +8,7 @@ import hashlib
 import os
 import re
 import shlex
+import stat
 import time
 from pathlib import Path
 
@@ -28,8 +29,8 @@ def snapshot_name(prompt_id: str, *, suffix_only: bool = False) -> str:
 def snapshot_manifest(session_root: Path) -> tuple[int, str]:
     """output / scratchpad 的 (总字节数, 内容指纹),不含 SNAPSHOT_EXCLUDED。
 
-    指纹由每个条目的路径、类型、权限、大小、mtime(符号链接取目标)算出;
-    目录的 mtime 不算在内(中间目录的增删会改动它)。不跟随符号链接。
+    指纹包括每个条目的路径、类型、权限、文件内容(符号链接取目标)。
+    不依赖可被脚本保留的 mtime,不跟随符号链接。读取失败时拒绝生成不完整清单。
     """
     total = 0
     entries: list[str] = []
@@ -50,15 +51,26 @@ def snapshot_manifest(session_root: Path) -> tuple[int, str]:
                             elif entry.is_dir(follow_symlinks=False):
                                 entries.append(f"d {path} {st.st_mode:o}")
                                 stack.append((Path(entry.path), path))
-                            else:
-                                total += st.st_size
-                                entries.append(
-                                    f"f {path} {st.st_mode:o} {st.st_size} {st.st_mtime_ns}"
+                            elif stat.S_ISREG(st.st_mode):
+                                fd = os.open(
+                                    entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                                 )
-                        except OSError:
-                            continue
-            except OSError:
-                continue
+                                with os.fdopen(fd, "rb") as source:
+                                    opened = os.fstat(source.fileno())
+                                    if not stat.S_ISREG(opened.st_mode):
+                                        raise ValueError(f"Not a regular snapshot file: {path}")
+                                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+                                total += opened.st_size
+                                entries.append(
+                                    f"f {path} {opened.st_mode:o} {opened.st_size} {digest}"
+                                )
+                            else:
+                                raise ValueError(f"Unsupported snapshot entry: {path}")
+                        except OSError as exc:
+                            raise OSError(f"Cannot fingerprint snapshot entry: {path}") from exc
+            except FileNotFoundError:
+                if rel != top:
+                    raise
     entries.sort()
     return total, hashlib.sha256("\0".join(entries).encode(errors="surrogateescape")).hexdigest()
 

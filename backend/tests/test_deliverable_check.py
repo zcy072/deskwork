@@ -1,5 +1,6 @@
 """交付前基础校验:空文件、损坏的 Office/PDF 被拦下,失败不动上次交付副本,连续失败后放行并警告。"""
 
+import asyncio
 import zipfile
 from types import SimpleNamespace
 
@@ -103,6 +104,7 @@ def session(tmp_path, monkeypatch):
         return True
 
     sess = SimpleNamespace(
+        workspace_lock=asyncio.Lock(),
         paths=SimpleNamespace(
             output=paths.output,
             session_root=paths.session_root,

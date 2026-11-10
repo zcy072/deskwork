@@ -5,6 +5,7 @@ from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from app.agents.boundary import BOUNDARY_INSTRUCTION
 from app.agents.checkpointers import get_checkpointer
+from app.agents.context import RunContext
 from app.agents.llms import get_fallback_models, get_model
 from app.agents.middlewares import (
     LoggingModelFallbackMiddleware,
@@ -90,7 +91,11 @@ def get_agent():
 
     外部 MCP 工具在 lifespan 里先加载(init_mcp),所以这里必须在它之后才首次调用。
     """
-    model = get_model()
+    return build_agent(model=get_model(), checkpointer=get_checkpointer())
+
+
+def build_agent(*, model, checkpointer):
+    """Assemble one application graph from explicitly owned dependencies."""
     roles = [visual_designer_sub_agent] + (multi_agent_roles if settings.MULTI_AGENT else [])
     task_tool = create_task_tool(sub_agent_tools, roles, model, DeepAgentState)
     fallbacks = get_fallback_models()
@@ -126,6 +131,7 @@ def get_agent():
             + (SEPERATOR + WEB_INSTRUCTION if web_enabled() else "")
         ),
         state_schema=DeepAgentState,
-        checkpointer=get_checkpointer(),
+        context_schema=RunContext,
+        checkpointer=checkpointer,
         middleware=middleware,
     )

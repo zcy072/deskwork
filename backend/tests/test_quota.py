@@ -161,8 +161,8 @@ async def test_upload_rejected_when_it_would_exceed_quota(tmp_path, monkeypatch)
 
 async def test_too_many_concurrent_runs_rejected(monkeypatch):
     monkeypatch.setattr(settings, "MAX_CONCURRENT_RUNS", 2)
-    monkeypatch.setitem(ops._active_agent_tasks, "a", object())
-    monkeypatch.setitem(ops._active_agent_tasks, "b", object())
+    ops.sessions.reserve("a")
+    ops.sessions.reserve("b")
     with pytest.raises(ops.TooManyRunsError):
         await ops.start_chat("c", "hi", [])
 
@@ -170,7 +170,7 @@ async def test_too_many_concurrent_runs_rejected(monkeypatch):
 async def test_run_limit_does_not_block_session_already_counted(monkeypatch):
     """已占用名额的会话再发消息应走原来的 409 逻辑,而不是 429。"""
     monkeypatch.setattr(settings, "MAX_CONCURRENT_RUNS", 1)
-    monkeypatch.setitem(ops._active_agent_tasks, "a", object())
+    ops.sessions.reserve("a")
 
     async def running(_sid):
         return "running"

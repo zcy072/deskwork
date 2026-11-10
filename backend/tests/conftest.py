@@ -16,3 +16,14 @@ os.environ["DATABASE_URL"] = ""
 os.environ.pop("SANDBOX_MANAGER_URL", None)
 # 测试不写日志文件,免得往开发用的 app.log 里灌测试产生的报错
 os.environ["LOG_FILE"] = ""
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_registry(monkeypatch):
+    from app.runtime.sessions import sessions
+
+    monkeypatch.setattr(sessions, "_slots", {})
+    monkeypatch.setattr(sessions, "closing", False)

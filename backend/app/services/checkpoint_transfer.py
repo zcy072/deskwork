@@ -67,7 +67,7 @@ async def _has_task_path(saver: AsyncSqliteSaver) -> bool:
 
 
 async def export_thread(saver: Any, thread_id: str) -> dict | None:
-    """线程的全部 checkpoint 与 writes;saver 不是 SQLite 实现(如内存)时返回 None。
+    """线程的全部 checkpoint 与 writes;没有记录或 saver 不是 SQLite 时返回 None。
 
     超过 MAX_ROWS / MAX_RAW_BYTES 抛 CheckpointRejected。"""
     if not isinstance(saver, AsyncSqliteSaver):
@@ -87,6 +87,10 @@ async def export_thread(saver: Any, thread_id: str) -> dict | None:
             (thread_id,),
         )
         ws = await cur.fetchall()
+    if not cps:
+        if ws:
+            raise CheckpointRejected("checkpoint 缺失,仅存在写入记录")
+        return None
     if len(cps) + len(ws) > MAX_ROWS:
         raise CheckpointRejected(f"checkpoint 记录过多({len(cps) + len(ws)} 条)")
     raw = sum(len(r[4] or b"") + len(r[5] or b"") for r in cps) + sum(len(r[7] or b"") for r in ws)

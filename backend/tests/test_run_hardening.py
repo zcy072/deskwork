@@ -128,7 +128,6 @@ async def test_start_chat_events_exclude_host_path(monkeypatch):
     monkeypatch.setattr(ops, "upload_session_files", upload)
     monkeypatch.setattr(ops, "_launch_agent_task", lambda *a, **k: None)
     monkeypatch.setattr(ops.CONTAINER_MANAGER, "snapshot_session", noop)
-    ops._starting_sessions.discard("s9")
     await ops.start_chat("s9", "hi", [])
     assert sent and all("host_path" not in s for s in sent)
     assert persisted == [[{"file_name": "a", "container_path": "/w/a"}]]

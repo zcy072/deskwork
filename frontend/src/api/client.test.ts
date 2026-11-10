@@ -5,6 +5,7 @@ beforeEach(() => localStorage.clear())
 afterEach(() => {
   onUnauthorized(null)
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
 })
 
 describe('api key', () => {
@@ -43,6 +44,21 @@ describe('streamEvents', () => {
     return out
   }
 
+  it('restores a terminal run when its Redis stream has expired', async () => {
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({
+        id: 'p', session_id: 's', status: 'complete', parts: [{ type: 'text', text: 'saved' }],
+        last_event_seq: 8,
+      }))
+      return new Response('{"detail":"expired"}', { status: 410 })
+    })
+    vi.stubGlobal('fetch', f)
+    const out = await collect(streamEvents('s', 'p', new AbortController().signal, fast))
+    expect(out.map((p) => p.event)).toEqual(['run.snapshot', 'stream.end'])
+    expect(out[0].data.parts[0].text).toBe('saved')
+    expect(f).toHaveBeenCalledTimes(2)
+  })
+
   it('失败后退避重试,并带着 lastId 续读', async () => {
     const f = vi
       .fn()
@@ -55,20 +71,20 @@ describe('streamEvents', () => {
     expect(JSON.parse(f.mock.calls[2][1].body).start_id).toBe('1-0')
   })
 
-  it('连续失败耗尽后查询状态:已结束则抛错', async () => {
+  it('连续失败且无法读取 Run 时保留错误', async () => {
     const f = vi.fn().mockImplementation(async (url: string) => {
-      if (String(url).includes('thread-status')) return new Response('{"status":"idle","prompt_id":null}')
       throw new TypeError('net')
     })
     vi.stubGlobal('fetch', f)
     await expect(collect(streamEvents('s', 'p', new AbortController().signal, { ...fast, maxFailures: 3 }))).rejects.toThrow('net')
-    expect(f.mock.calls.filter((c) => !String(c[0]).includes('thread-status'))).toHaveLength(3)
+    expect(f.mock.calls.filter((c) => c[0] === '/stream-events')).toHaveLength(3)
+    expect(f.mock.calls.some((c) => c[0] === '/runs/p')).toBe(true)
   })
 
   it('耗尽后线程仍在运行则继续尝试', async () => {
     let n = 0
     const f = vi.fn().mockImplementation(async (url: string) => {
-      if (String(url).includes('thread-status')) return new Response('{"status":"running","prompt_id":"p"}')
+      if (url === '/runs/p') return new Response('{"id":"p","status":"running"}')
       if (++n <= 2) throw new TypeError('net')
       return sse({ id: '1-0', event: 'stream.end', data: {} })
     })
@@ -116,14 +132,140 @@ describe('streamEvents', () => {
 
   it('反复收到空响应时有上限,线程已结束则报错', async () => {
     const f = vi.fn().mockImplementation(async (url: string) => {
-      if (String(url).includes('thread-status')) return new Response('{"status":"complete","prompt_id":null}')
+      if (url === '/runs/p') return new Response('{"detail":"unavailable"}', { status: 503 })
       return new Response('', { status: 200 })
     })
     vi.stubGlobal('fetch', f)
     await expect(
-      collect(streamEvents('s', 'p', new AbortController().signal, { ...fast, maxFailures: 2 })),
+      collect(streamEvents('s', 'p', new AbortController().signal, { ...fast, maxFailures: 2, extraRounds: 0 })),
     ).rejects.toThrow('未收到结束标记')
-    expect(f.mock.calls.filter((c) => !String(c[0]).includes('thread-status'))).toHaveLength(2)
+    expect(f.mock.calls.filter((c) => String(c[0]) === '/stream-events')).toHaveLength(2)
+  })
+
+  it('uses the saved run when the terminal stream event was lost', async () => {
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({
+        id: 'p', session_id: 's', status: 'complete', parts: [{ type: 'text', text: 'finished' }],
+        last_event_seq: 7,
+      }))
+      return new Response('')
+    })
+    vi.stubGlobal('fetch', f)
+    const result = await collect(streamEvents('s', 'p', new AbortController().signal, { ...fast, maxFailures: 2 }))
+    expect(result.map((p) => p.event)).toEqual(['run.snapshot', 'stream.end'])
+    expect(result[0].data.parts[0].text).toBe('finished')
+  })
+
+  it('阻塞后空响应也会读取本次 Run,不被另一个正在运行的任务干扰', async () => {
+    let clock = 0
+    vi.spyOn(Date, 'now').mockImplementation(() => clock)
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({
+        id: 'p', status: 'error', message: '服务重启', parts: [], last_event_seq: 3,
+      }))
+      if (url.includes('thread-status')) return new Response('{"status":"running","prompt_id":"different-run"}')
+      return new Response(new ReadableStream({
+        async pull(controller) {
+          await new Promise(r => setTimeout(r, 10))
+          clock += 4000 // 模拟阻塞 XREAD 的空响应,头已返回而响应体稍后结束。
+          controller.close()
+        },
+      }))
+    })
+    vi.stubGlobal('fetch', f)
+    const ac = new AbortController()
+    const deadline = setTimeout(() => ac.abort(), 2000)
+    try {
+      const result = await collect(streamEvents('s', 'p', ac.signal, { ...fast, maxFailures: 2 }))
+      expect(result.map(p => p.event)).toEqual(['run.snapshot', 'stream.end'])
+      expect(result[1].data.status).toBe('error')
+      expect(f.mock.calls.filter(c => c[0] === '/stream-events')).toHaveLength(2)
+      expect(f.mock.calls.some(c => String(c[0]).includes('thread-status'))).toBe(false)
+    } finally {
+      clearTimeout(deadline)
+    }
+  })
+
+  it('长工具调用的空响应不会耗尽网络重试额度', async () => {
+    let polls = 0
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({ id: 'p', status: 'running' }))
+      if (++polls <= 4) return new Response('')
+      return sse({ event: 'stream.end', data: { status: 'complete' } })
+    })
+    vi.stubGlobal('fetch', f)
+    const result = await collect(streamEvents('s', 'p', new AbortController().signal,
+      { ...fast, maxFailures: 1, extraRounds: 0 }))
+    expect(result).toEqual([{ event: 'stream.end', data: { status: 'complete' } }])
+    expect(f.mock.calls.filter(c => c[0] === '/runs/p')).toHaveLength(4)
+  })
+
+  it('网络重试耗尽后读取具体 Run 的最终快照', async () => {
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({
+        id: 'p', status: 'complete', parts: [{ type: 'text', text: 'saved' }], last_event_seq: 4,
+      }))
+      throw new TypeError('connection lost')
+    })
+    vi.stubGlobal('fetch', f)
+    const result = await collect(streamEvents('s', 'p', new AbortController().signal,
+      { ...fast, maxFailures: 1 }))
+    expect(result.map(p => p.event)).toEqual(['run.snapshot', 'stream.end'])
+    expect(result[0].data.parts).toEqual([{ type: 'text', text: 'saved' }])
+  })
+
+  it('流丢失但正在收尾时继续读取,直到终态落库', async () => {
+    let reads = 0
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({
+        id: 'p', status: ++reads === 1 ? 'running' : 'cancelled',
+        parts: [{ type: 'text', text: reads === 1 ? 'partial' : 'final' }], last_event_seq: reads,
+      }))
+      return new Response('{"detail":"expired"}', { status: 410 })
+    })
+    vi.stubGlobal('fetch', f)
+    const result = await collect(streamEvents('s', 'p', new AbortController().signal, fast))
+    expect(result.map(p => p.event)).toEqual(['run.snapshot', 'run.snapshot', 'stream.end'])
+    expect(result.at(-1)?.data.status).toBe('cancelled')
+  })
+
+  it('取消等待中的终态查询后不再发布快照或发起请求', async () => {
+    const ac = new AbortController()
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') {
+        ac.abort()
+        return new Response(JSON.stringify({ id: 'p', status: 'complete', parts: [] }))
+      }
+      return new Response('')
+    })
+    vi.stubGlobal('fetch', f)
+    expect(await collect(streamEvents('s', 'p', ac.signal, { ...fast, maxFailures: 1 }))).toEqual([])
+    expect(f).toHaveBeenCalledTimes(2)
+  })
+
+  it('丢流且始终无法保存终态时停止重试并保留明确错误', async () => {
+    const f = vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({ id: 'p', status: 'running', parts: [] }))
+      return new Response('{"detail":"expired"}', { status: 410 })
+    })
+    vi.stubGlobal('fetch', f)
+    await expect(collect(streamEvents('s', 'p', new AbortController().signal,
+      { ...fast, extraRounds: 1 }))).rejects.toThrow('事件流已丢失')
+    expect(f.mock.calls.filter(c => c[0] === '/runs/p')).toHaveLength(2)
+  })
+
+  it('持续无字节的超时也会查询已保存的终态', async () => {
+    const f = vi.fn().mockImplementation(async (url: string, init: RequestInit) => {
+      if (url === '/runs/p') return new Response(JSON.stringify({ id: 'p', status: 'complete', parts: [] }))
+      return new Response(new ReadableStream({ start(controller) {
+        init.signal!.addEventListener('abort', () => controller.error(new DOMException('timeout', 'AbortError')))
+      } }))
+    })
+    vi.stubGlobal('fetch', f)
+    const result = await collect(streamEvents('s', 'p', new AbortController().signal,
+      { ...fast, maxFailures: 1, idleTimeoutMs: 20 }))
+    expect(result.map(p => p.event)).toEqual(['run.snapshot', 'stream.end'])
+    expect(f).toHaveBeenCalledTimes(2)
   })
 })
 

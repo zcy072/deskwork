@@ -14,6 +14,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from pathlib import Path
 
+from app.runtime.sessions import complete_before_cancelling, sessions
 from app.sandbox import CONTAINER_MANAGER
 from app.sandbox.session_paths import SessionPaths
 
@@ -112,6 +113,9 @@ async def _convert(session_id: str, rel: str, host: Path, digest: str) -> tuple[
 
 async def office_to_pdf(session_id: str, relative_path: str) -> bytes:
     """返回 PDF 字节。抛 ValueError / FileNotFoundError(请求有误)或 PreviewError(转换失败)。"""
+    handle = sessions.get(session_id)
+    if sessions.closing or (handle and handle.operation != "run"):
+        raise PreviewError("会话正在执行维护操作,请稍后再试")
     _, host, rel = await asyncio.to_thread(_locate, session_id, relative_path)
     try:
         digest = await asyncio.to_thread(_digest, host)
@@ -123,6 +127,9 @@ async def office_to_pdf(session_id: str, relative_path: str) -> bytes:
         return _CACHE[key]
     task = _INFLIGHT.get(key)
     if task is None:
+        handle = sessions.get(session_id)
+        if sessions.closing or (handle and handle.operation != "run"):
+            raise PreviewError("会话正在执行维护操作,请稍后再试")
         task = asyncio.create_task(_convert(session_id, rel, host, digest))
         _INFLIGHT[key] = task
 
@@ -155,3 +162,18 @@ async def prewarm(session_id: str, relative_paths: list[str]) -> None:
         seen.add(rel)
         with suppress(ValueError, FileNotFoundError, PreviewError, OSError):
             await office_to_pdf(session_id, rel)
+
+
+async def drain_previews(session_id: str | None = None) -> None:
+    tasks = [
+        task for key, task in list(_INFLIGHT.items()) if session_id is None or key[0] == session_id
+    ]
+    if tasks:
+
+        async def drain():
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await complete_before_cancelling(asyncio.create_task(drain()))
+    for key in list(_CACHE):
+        if session_id is None or key[0] == session_id:
+            _CACHE.pop(key, None)

@@ -115,7 +115,7 @@ def test_delete_endpoint(client, paths, monkeypatch):
 
 def test_delete_endpoint_blocked_while_running(client, paths, monkeypatch):
     (paths.session_root / "output" / "a.txt").write_bytes(b"x")
-    monkeypatch.setattr(stream, "get_active_prompt_id", lambda _sid: "p1")
+    stream.sessions.reserve("s")
     r = client.delete("/files", params={"session_id": "s", "relative_path": "output/a.txt"})
     assert r.status_code == 409
     assert (paths.session_root / "output" / "a.txt").exists()
@@ -155,7 +155,7 @@ def test_clear_versions_endpoint(client, paths, monkeypatch):
     d = paths.session_root / "versions" / "a.txt"
     (d / "100").write_bytes(b"1" * 5)
     assert client.delete("/files/versions", params={"session_id": "s"}).json() == {"freed": 5}
-    monkeypatch.setattr(stream, "get_active_prompt_id", lambda _sid: "p1")
+    stream.sessions.reserve("s")
     (d / "300").write_bytes(b"1")
     assert client.delete("/files/versions", params={"session_id": "s"}).status_code == 409
     assert (d / "300").exists()
@@ -185,7 +185,7 @@ def test_clear_scratchpad_missing_dir(tmp_path):
 def test_clear_scratchpad_endpoint(client, paths, monkeypatch):
     (paths.session_root / "scratchpad" / "a").write_bytes(b"1" * 3)
     assert client.delete("/files/scratchpad", params={"session_id": "s"}).json() == {"freed": 3}
-    monkeypatch.setattr(stream, "get_active_prompt_id", lambda _sid: "p1")
+    stream.sessions.reserve("s")
     (paths.session_root / "scratchpad" / "b").write_bytes(b"1")
     assert client.delete("/files/scratchpad", params={"session_id": "s"}).status_code == 409
     assert (paths.session_root / "scratchpad" / "b").exists()

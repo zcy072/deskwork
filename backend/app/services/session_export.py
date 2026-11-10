@@ -25,7 +25,7 @@ from app.db.models import Conversation, Message
 from app.sandbox.session_paths import SessionPaths
 from app.services.storage import DELETABLE_DIRS
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 # 修改 Agent 的节点/状态结构或 checkpoint 恢复语义时递增;提示词改动不需要递增。
 GRAPH_VERSION = 1
 CHECKPOINT_PACKAGES = (
@@ -48,11 +48,15 @@ def _iso(dt: datetime) -> str:
 
 
 def conversation_document(
-    conv: Conversation, messages: list[Message], attachments: dict[int, list[dict]]
+    conv: Conversation,
+    messages: list[Message],
+    attachments: dict[int, list[dict]],
+    runs: dict | None = None,
 ) -> dict:
     return {
         "id": conv.id,
         "title": conv.title,
+        "graph_checkpoint_id": conv.graph_checkpoint_id,
         "created_at": _iso(conv.created_at),
         "updated_at": _iso(conv.updated_at),
         "messages": [
@@ -65,6 +69,20 @@ def conversation_document(
                 "status": m.status,
                 "usage": m.usage,
                 "created_at": _iso(m.created_at),
+                "last_event_seq": m.last_event_seq or 0,
+                **(
+                    {
+                        "run": {
+                            "status": runs[m.prompt_id].status,
+                            "error_code": runs[m.prompt_id].error_code,
+                            "public_error": runs[m.prompt_id].public_error,
+                            "turn_id": runs[m.prompt_id].turn_id,
+                            "input_committed": runs[m.prompt_id].input_committed,
+                        }
+                    }
+                    if runs and m.prompt_id in runs
+                    else {}
+                ),
                 **(
                     {
                         "checkpoint_id": m.checkpoint_id,

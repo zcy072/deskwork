@@ -2,6 +2,7 @@ from langchain.tools import tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+from app.agents.permissions import policy_for
 from app.config import settings
 from app.db import repository
 from app.owner import current_owner
@@ -45,7 +46,7 @@ async def remember(content: str, ttl_days: int | None = None) -> str:
         content = normalize_memory(content)  # 先校验,不让用户确认一条存不进去的记忆
     except MemoryRejected as exc:
         return f"Error: {exc}"
-    if settings.MEMORY_CONFIRM_WRITES:
+    if settings.MEMORY_CONFIRM_WRITES and policy_for("remember") != "confirm":
         answer = interrupt(
             {
                 "question": f"要把这条信息存入长期记忆吗?\n{content}",

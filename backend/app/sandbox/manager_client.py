@@ -121,6 +121,11 @@ class ManagerClient:
         if not self.base_url:
             raise RuntimeError("SANDBOX_MANAGER_URL is not set; the sandbox needs sandbox-manager")
 
+    async def aclose(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
+
     @property
     def http(self) -> httpx.AsyncClient:
         if self._http is None:
