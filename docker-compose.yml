@@ -32,7 +32,7 @@ services:
     # bwrap 需要创建用户 / PID / mount 命名空间,而 Docker 默认 seccomp 禁止 unshare / clone(NEWUSER) / mount 等。
     # sandbox/seccomp.json = Docker 默认 profile(moby/profiles)+ 无条件放开 unshare、setns、clone、clone3、
     # mount、umount2、pivot_root、sethostname、setdomainname,其余(keyctl、bpf、perf_event_open 等)仍被拦。
-    # AppArmor 保持默认。更新 Docker 默认 profile 时需要重新生成,见 docs/architecture/04-专题-沙箱与命令安全.md §3。
+    # AppArmor 保持默认。更新 Docker 默认 profile 时需要重新生成,见 docs/项目导读/04-专题-沙箱与命令安全.md §3。
     security_opt:
       - seccomp=./sandbox/seccomp.json
     cap_drop:
@@ -71,7 +71,7 @@ services:
   backend:
     build: ./backend
     container_name: deskwork_backend
-    # 以非 root 的 app 用户(UID 与沙箱 agent 相同)运行;旧数据属 root 时需迁移一次,见 docs/DEPLOY_NON_ROOT.md
+    # 以非 root 的 app 用户(UID 与沙箱 agent 相同)运行;数据目录须属该 UID,入口脚本会检查
     restart: unless-stopped
     healthcheck:
       # /health 公开、只查 Redis 和数据库;start_period 留给建表、加载 checkpointer 和 MCP

@@ -100,7 +100,7 @@ flowchart LR
 | `/workspace/output` | `sandbox_data/sessions/<id>/output` | 交付给用户的成品 |
 | `/workspace/skills` | `sandbox_data/default_skills` | 共享只读技能库 |
 
-想读懂实现,从 [系统总览](docs/architecture/01-系统总览.md) 开始,再按需读 02–07 各专题。
+想读懂这个项目,看 [项目导读](docs/项目导读/):从 [01 系统总览](docs/项目导读/01-系统总览.md) 开始,再按需读 02–07。
 
 ## 技术栈
 
@@ -243,7 +243,7 @@ docker compose up --build
 ├── sandbox/                # 沙箱镜像、sandbox-manager、seccomp 配置
 ├── sandbox_data/           # 内置技能与各会话的运行数据
 ├── evals/                  # 评测用例、运行器、规则检查与 LLM 评审
-├── docs/                   # architecture/ 架构说明(01–07),部署迁移说明
+├── docs/                   # 项目导读(01–07),帮助读懂代码
 └── docker-compose.yml      # Redis、沙箱、sandbox-manager、后端、Web
 ```
 
