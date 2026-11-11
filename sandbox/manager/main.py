@@ -397,7 +397,14 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
         for task in readers:
             task.cancel()
         await asyncio.gather(reader_in, *readers, return_exceptions=True)
-        audit("spawn", "end", started, session=session, exit=proc.returncode, stopped=stop_state["stopped"])
+        audit(
+            "spawn",
+            "end",
+            started,
+            session=session,
+            exit=proc.returncode,
+            stopped=stop_state["stopped"],
+        )
         if proc.returncode is None:
             # 仅在进程仍在运行(异常断连)时清理;正常退出后命名空间已消失
             await kill_in_container()
