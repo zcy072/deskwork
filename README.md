@@ -100,8 +100,7 @@ flowchart LR
 | `/workspace/output` | `sandbox_data/sessions/<id>/output` | 交付给用户的成品 |
 | `/workspace/skills` | `sandbox_data/default_skills` | 共享只读技能库 |
 
-更完整的设计取舍和长期约束见 [设计说明](docs/DESIGN_NOTES.md)。
-本次架构改进、关键代码、验证结果、部署状态及 AI 审查重点统一见 [重构审查交接文档](docs/architecture/deskwork-architecture-refactor.md)。
+想读懂实现,从 [系统总览](docs/architecture/01-系统总览.md) 开始,再按需读 02–07 各专题。
 
 ## 技术栈
 
@@ -244,7 +243,7 @@ docker compose up --build
 ├── sandbox/                # 沙箱镜像、sandbox-manager、seccomp 配置
 ├── sandbox_data/           # 内置技能与各会话的运行数据
 ├── evals/                  # 评测用例、运行器、规则检查与 LLM 评审
-├── docs/                   # 设计说明与部署文档
+├── docs/                   # architecture/ 架构说明(01–07),部署迁移说明
 └── docker-compose.yml      # Redis、沙箱、sandbox-manager、后端、Web
 ```
 
