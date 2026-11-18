@@ -57,7 +57,7 @@ async def require_api_key(request: Request) -> None:
         await _check(request, "authfail", settings.RATE_LIMIT_PER_MINUTE, client_id=_ip_id(request))
         raise HTTPException(
             status_code=401,
-            detail="Invalid or missing API key",
+            detail="访问密钥无效或未填写",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -90,7 +90,7 @@ async def _check(request: Request, scope: str, limit: int, client_id: str | None
         retry_after = WINDOW_SECONDS - int(time.time()) % WINDOW_SECONDS
         raise HTTPException(
             status_code=429,
-            detail="Too many requests",
+            detail="请求太频繁,请稍后再试",
             headers={"Retry-After": str(retry_after)},
         )
 

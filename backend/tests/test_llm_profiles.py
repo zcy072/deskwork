@@ -152,3 +152,23 @@ def test_anthropic_max_tokens_comes_from_settings(monkeypatch):
     monkeypatch.setattr(settings, "LLM_MAX_TOKENS", 32000)
     p = llms.LLMProfile("default", "anthropic", "k", "https://relay.example", "claude-sonnet-5-5")
     assert llms.build_model(p).max_tokens == 32000
+
+
+def test_model_request_timeout_is_explicit_for_all_protocols(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_REQUEST_TIMEOUT_SECONDS", 12)
+    monkeypatch.setattr(settings, "LLM_API_VERSION", "2024-10-21")
+    openai = llms.build_model(llms.LLMProfile("o", "openai", "test", None, "test"))
+    anthropic = llms.build_model(
+        llms.LLMProfile("a", "anthropic", "test", None, "claude-sonnet-5-5")
+    )
+    azure = llms.build_model(
+        llms.LLMProfile("z", "azure", "test", "https://test.openai.azure.com", "test")
+    )
+    assert openai.request_timeout == azure.request_timeout == 12
+    assert anthropic.default_request_timeout == 12
+
+
+def test_openai_compatible_with_base_url_streams_usage():
+    # langchain-openai 默认只在没设 base_url 时要流式用量;没有它预算和用量统计都会落空
+    p = llms.LLMProfile("default", "deepseek", "k", "https://relay.example/v1", "deepseek-chat")
+    assert llms.build_model(p)._should_stream_usage() is True

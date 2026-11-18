@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useMessage } from 'naive-ui'
+import { getCapabilities } from '@/api/client'
 import { useChatStore } from '@/stores/chat'
+import { admitFiles, DEFAULT_UPLOAD_LIMITS, type UploadLimits } from '@/utils/uploadLimits'
 import { isNearBottom, isNearTop } from '@/utils/scroll'
 import { isImeEnter } from '@/utils/keys'
 import MessageBubble from './MessageBubble.vue'
@@ -35,9 +38,26 @@ function useTemplate(t: string) {
   nextTick(() => composer.value?.focus())
 }
 
+const message = useMessage()
+const uploadLimits = ref<UploadLimits>(DEFAULT_UPLOAD_LIMITS)
+onMounted(async () => {
+  try {
+    const caps = await getCapabilities()
+    if (caps.upload_limits) uploadLimits.value = caps.upload_limits
+  } catch {
+    /* 拿不到就用默认值,服务端仍会兜底校验 */
+  }
+})
+/** 所有加文件的入口(选择、拖拽、粘贴)都走这里,超限的当场提示 */
+function addFiles(incoming: File[]) {
+  const { accepted, rejected } = admitFiles(files.value, incoming, uploadLimits.value)
+  files.value.push(...accepted)
+  if (rejected.length) message.warning(rejected.join('\n'), { duration: 6000 })
+}
+
 function onPick(e: Event) {
   const input = e.target as HTMLInputElement
-  files.value.push(...Array.from(input.files ?? []))
+  addFiles(Array.from(input.files ?? []))
   input.value = ''
 }
 
@@ -57,7 +77,7 @@ function onDrop(e: DragEvent) {
   dragDepth = 0
   dragging.value = false
   if (chat.running) return
-  files.value.push(...Array.from(e.dataTransfer?.files ?? []))
+  addFiles(Array.from(e.dataTransfer?.files ?? []))
 }
 function onPaste(e: ClipboardEvent) {
   if (chat.running) return
@@ -66,8 +86,8 @@ function onPaste(e: ClipboardEvent) {
   e.preventDefault()
   // 截图粘贴出来的文件都叫 image.png,加时间戳和序号避免重名
   const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')
-  files.value.push(
-    ...pasted.map((f, i) =>
+  addFiles(
+    pasted.map((f, i) =>
       f.name && f.name !== 'image.png' ? f : new File([f], `screenshot-${stamp}-${i + 1}.png`, { type: f.type }),
     ),
   )
@@ -220,7 +240,7 @@ watch(
           <n-button size="tiny" quaternary @click="dismissLostFiles">知道了</n-button>
         </div>
         <div v-if="files.length" class="picked">
-          <n-tag v-for="(f, i) in files" :key="i" closable size="small" @close="files.splice(i, 1)">{{ f.name }}</n-tag>
+          <n-tag v-for="(f, i) in files" :key="i" closable size="small" :title="f.name" @close="files.splice(i, 1)">{{ f.name }}</n-tag>
         </div>
         <n-input
           ref="composer"
@@ -238,7 +258,7 @@ watch(
           <input ref="picker" type="file" multiple hidden @change="onPick" />
           <n-button :disabled="chat.running" @click="picker?.click()">添加文件</n-button>
           <span class="hint">Enter 发送 · Shift+Enter 换行</span>
-          <n-button v-if="chat.running" type="warning" :loading="chat.cancelling" @click="chat.stop()">
+          <n-button v-if="chat.running" type="warning" :loading="chat.cancelling" :disabled="chat.preparing" @click="chat.stop()">
             停止生成
           </n-button>
           <n-button v-else type="primary" :disabled="!text.trim() && files.length === 0" @click="submit">
@@ -272,6 +292,8 @@ watch(
 .card :deep(.n-input__border), .card :deep(.n-input__state-border) { display: none; }
 .lost { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
 .picked { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.picked :deep(.n-tag) { max-width: 100%; }
+.picked :deep(.n-tag__content) { overflow: hidden; text-overflow: ellipsis; }
 .usage { margin-top: 6px; font-size: 12px; color: var(--muted); }
 .hint { flex: 1; text-align: center; font-size: 12px; color: var(--muted); }
 @media (max-width: 900px) { .hint { display: none; } }

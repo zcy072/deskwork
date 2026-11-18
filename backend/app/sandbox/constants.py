@@ -2,9 +2,8 @@ import os
 from pathlib import Path
 
 # Docker sandbox
-CONTAINER_NAME = "sandbox"
+CONTAINER_NAME = os.environ.get("SANDBOX_CONTAINER", "sandbox")
 CONTAINER_AGENT_USER = "agent"  # agent bash execution (restricted)
-CONTAINER_ROOT = "root"
 
 # Host layout: sandbox_data/{sessions/<id>, default_skills}
 # 本地开发时位于仓库根目录(backend/ 的上一级);容器内通过 SANDBOX_DATA_DIR 指定挂载点。
@@ -37,6 +36,8 @@ BASH_SENTINEL = "__BASH_DONE__"
 
 # Output limits (per Claude bash tool best practices)
 OUTPUT_MAX_LINES = 300
+# 每路输出(stdout/stderr)交给模型的字符上限:一行压缩 JSON 或 base64 就能有几 MB,只按行数截不住
+OUTPUT_MAX_CHARS = 30_000
 # 超长输出落盘时保存的字符上限,防止撑爆磁盘
 SPILL_MAX_CHARS = 5_000_000
 

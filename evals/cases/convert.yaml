@@ -1,0 +1,30 @@
+- id: ocr-scan-contract
+  category: 文件转换与识别
+  files: [scan_contract.pdf]
+  prompt: scan_contract.pdf 是扫描件。告诉我合同编号、合同金额和付款期限。
+  checks:
+    - no_error: true
+    - answer_contains: ["HT-2024-0317"]
+    - answer_regex: "386,?500"
+  rubric: 夹具是纯图片 PDF(无文字层),内容为采购合同,编号 HT-2024-0317,金额 386500 元,付款期限为收到发票后三十日内。合格的回答用 OCR 读出这些信息,而不是说读不到或编造。
+- id: convert-xls-xlsx
+  category: 文件转换与识别
+  files: [inventory.xls]
+  prompt: 把 inventory.xls 转成 xlsx 格式,并告诉我三种品名的库存总数。
+  checks:
+    - no_error: true
+    - file_exists: "*.xlsx"
+    - file_contains: {glob: "*.xlsx", all: ["螺丝", "螺母", "垫片"]}
+    - answer_contains: ["450"]
+  rubric: 转换后的 xlsx 保留三行数据(螺丝 120、螺母 80、垫片 250),库存总数为 450。
+- id: convert-doc-docx
+  category: 文件转换与识别
+  files: [notice.doc]
+  prompt: 把 notice.doc 转成 docx,并告诉我放假几天、值班电话是多少。
+  checks:
+    - no_error: true
+    - file_exists: "*.docx"
+    - file_contains: {glob: "*.docx", all: ["放假通知", "0571-88886666"]}
+    - answer_contains: ["0571-88886666"]
+    - answer_regex: "(7|七)\\s*天"
+  rubric: 通知写明 10 月 1 日至 10 月 7 日放假,共 7 天;值班电话 0571-88886666。转换后的 docx 内容与原文一致。

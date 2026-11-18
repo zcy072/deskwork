@@ -235,6 +235,11 @@ describe('外传防护:图片以外的自动请求', () => {
     '<img srcset="https://evil.test/a.png 1x" src="data:image/png;base64,AA">',
     '<video poster="https://evil.test/p.png"></video>',
     '<picture><source srcset="https://evil.test/a.png"><img src="data:image/png;base64,AA"></picture>',
+    '<svg><image href="https://evil.test/a.png"></image></svg>',
+    '<svg><image xlink:href="https://evil.test/a.png"></image></svg>',
+    '<svg><filter><feImage href="https://evil.test/a.png"/></filter></svg>',
+    '<input type="image" src="https://evil.test/a.png">',
+    '<table background="https://evil.test/a.png"><tr><td>x</td></tr></table>',
   ])('%s', (src) => {
     expect(renderMarkdown(src)).not.toContain('evil.test')
   })

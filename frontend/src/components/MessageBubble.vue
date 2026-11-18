@@ -108,7 +108,7 @@ watch(
     <div v-if="!isUser" class="avatar" aria-hidden="true" />
     <div class="bubble" :class="{ user: isUser, editing }">
       <div v-if="message.attachments?.length" class="attach">
-        <n-tag v-for="n in message.attachments" :key="n" size="small">{{ n }}</n-tag>
+        <n-tag v-for="n in message.attachments" :key="n" size="small" :title="n">{{ n }}</n-tag>
       </div>
       <template v-if="editing">
         <n-input v-model:value="draft" type="textarea" :autosize="{ minRows: 2, maxRows: 10 }" />
@@ -126,7 +126,7 @@ watch(
           :kind="it.askKind"
           :options="it.options"
           :active="askActive"
-          @answer="(t) => chat.send(t, [])"
+          @answer="(t) => it.interruptId ? chat.send(t, [], undefined, it.interruptId) : chat.send(t, [])"
         />
         <DeliveredFiles v-else-if="it.kind === 'files'" :files="it.files" />
         <template v-else-if="it.kind === 'widgets'">
@@ -134,7 +134,7 @@ watch(
         </template>
       </template>
       <div v-if="sources.length" class="sources" aria-label="原文来源">
-        <n-button v-for="source in sources" :key="source.id" size="tiny" @click="previewing = source">{{ sourceLabel(source) }}</n-button>
+        <n-button v-for="source in sources" :key="source.id" size="tiny" :title="sourceLabel(source)" @click="previewing = source">{{ sourceLabel(source) }}</n-button>
       </div>
       <n-spin v-if="live && !isUser" class="working" :size="16" />
       <n-alert v-if="message.status === 'error'" type="error" :show-icon="false" class="inline-error" role="alert">
@@ -171,6 +171,9 @@ watch(
 .sources { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .working { display: block; margin: 8px 0 2px; }
 .attach { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+/* 标签默认不换行,长文件名会撑破气泡;限宽后省略,悬停看全名 */
+.attach :deep(.n-tag), .sources :deep(.n-button) { max-width: 100%; }
+.attach :deep(.n-tag__content), .sources :deep(.n-button__content) { overflow: hidden; text-overflow: ellipsis; }
 .bubble.editing { min-width: min(520px, 85vw); }
 .actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
 /* 悬停(或键盘聚焦)时才显示操作,触屏设备没有悬停所以常显 */
@@ -190,14 +193,18 @@ watch(
 .md :deep(li) { margin: 3px 0; }
 .md :deep(li::marker) { color: var(--accent); }
 .md :deep(hr) { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
-.md :deep(table) { max-width: 100%; margin: 10px 0; }
+/* 长链接、长路径没有空格可断,不断开会把整条消息撑出横向滚动 */
+.md { overflow-wrap: anywhere; }
+/* 宽表格在表格自身里横向滚动,而不是被裁掉(原来 overflow: hidden 会直接截断右侧列) */
+.md :deep(table) { display: block; width: max-content; max-width: 100%; overflow-x: auto; margin: 10px 0; }
+.md :deep(th), .md :deep(td) { overflow-wrap: normal; min-width: 4em; }
 .md :deep(pre) { position: relative; background: var(--app-bg); border: 1px solid var(--line); padding: 12px 14px; border-radius: 10px; overflow: auto; font-size: 13px; line-height: 1.6; margin: 10px 0; }
 .md :deep(.code-copy) { position: absolute; top: 6px; right: 6px; font-size: 12px; line-height: 1; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card-bg); color: var(--muted); cursor: pointer; opacity: 0; transition: opacity .15s; }
 .md :deep(pre:hover .code-copy), .md :deep(.code-copy:focus-visible) { opacity: 1; }
 @media (hover: none) { .md :deep(.code-copy) { opacity: 1; } }
 .md :deep(code) { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 .md :deep(:not(pre) > code) { background: var(--soft); padding: 1px 6px; border-radius: 5px; font-size: .9em; }
-.md :deep(table) { border-collapse: separate; border-spacing: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-size: 14px; }
+.md :deep(table) { border-collapse: separate; border-spacing: 0; border: 1px solid var(--line); border-radius: 10px; font-size: 14px; }
 .md :deep(th), .md :deep(td) { border-bottom: 1px solid var(--line); padding: 7px 12px; text-align: left; }
 .md :deep(th) { background: var(--soft); font-weight: 600; }
 .md :deep(tr:last-child td) { border-bottom: none; }

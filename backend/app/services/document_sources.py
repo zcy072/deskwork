@@ -11,7 +11,7 @@ def read_source(paths: SessionPaths, relative_path: str) -> bytes:
     host = paths.resolve_host_path(relative_path)
     root = paths.session_root.resolve()
     if not any(host.is_relative_to(root / name) for name in ("uploads", "output")):
-        raise ValueError("Invalid source path")
+        raise ValueError("引用的文件路径无效")
     data = paths.read_host_file(host, MAX_SOURCE_BYTES + 1)
     if len(data) > MAX_SOURCE_BYTES:
         raise ValueError("引用文件超过 50 MB,请下载后查看")

@@ -150,7 +150,7 @@ def _old_schema_db(path):
 async def test_init_db_adds_missing_columns_indexes_and_normalizes_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(settings, "DATABASE_URL", "")
-    _old_schema_db(tmp_path / "workmate.sqlite")
+    _old_schema_db(tmp_path / "deskwork.sqlite")
     await close_db()
     await init_db()
     try:

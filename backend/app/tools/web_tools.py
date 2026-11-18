@@ -3,7 +3,9 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.context import session_id_of
 from app.config import settings
+from app.runtime.sessions import file_io
 from app.sandbox import CONTAINER_MANAGER
 from app.services import web_access
 from app.services.web_access import FETCH_TOOL, SEARCH_TOOL, WebToolError
@@ -84,13 +86,16 @@ class WebFetchInput(BaseModel):
 
 async def _save_full(runtime: ToolRuntime, content: str) -> str | None:
     try:
-        session_id = runtime.config.get("configurable", {})["thread_id"]
+        session_id = session_id_of(runtime)
         session = await CONTAINER_MANAGER.get_or_create(session_id)
         paths = session.paths
     except Exception as exc:
         logger.warning("web_fetch 取会话目录失败: %s", exc)
         return None
-    return web_access.save_full_page(paths.scratchpad, paths.virtual_scratchpad, content)
+    # 最多几 MB 的同步写盘,放到线程里,别卡住事件循环上的其他会话
+    return await file_io(
+        web_access.save_full_page, paths.scratchpad, paths.virtual_scratchpad, content
+    )
 
 
 @tool(description=WEB_FETCH_DESCRIPTION, args_schema=WebFetchInput)

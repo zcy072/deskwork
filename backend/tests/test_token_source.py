@@ -7,6 +7,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.services import chat_operations as ops
+from tests.history_seed import run_turn
 
 
 class _Model(GenericFakeChatModel):
@@ -14,7 +15,7 @@ class _Model(GenericFakeChatModel):
         return self
 
 
-async def test_summary_text_is_not_streamed_as_answer(monkeypatch):
+async def test_summary_text_is_not_streamed_as_answer(run_db, monkeypatch):
     summarizer = _Model(messages=iter([AIMessage(content="SUMMARY TEXT")] * 3))
     agent = create_agent(
         model=_Model(messages=iter([AIMessage(content="final answer")])),
@@ -40,13 +41,9 @@ async def test_summary_text_is_not_streamed_as_answer(monkeypatch):
 
     monkeypatch.setattr(ops, "get_agent", lambda: agent)
     monkeypatch.setattr(ops, "_push", push)
-    monkeypatch.setattr(ops, "set_thread_status", noop)
-    monkeypatch.setattr(ops, "persist_assistant_turn", noop)
-    monkeypatch.setattr(ops, "mark_done", noop)
-    monkeypatch.setattr(ops, "refresh_running_ttl", noop)
-    monkeypatch.setattr(ops, "is_db_ready", lambda: False)
+    monkeypatch.setattr(ops.CONTAINER_MANAGER, "snapshot_session", noop)
 
-    await ops._run_agent("p", "s", "q")
+    await run_turn("s", "p", "q")
     text = "".join(d["text"] for e, d in events if e == "ai.token")
     assert "final answer" in text
     assert "SUMMARY" not in text

@@ -54,7 +54,7 @@ describe('原文预览', () => {
     vi.mocked(fetchFileBlob).mockResolvedValue(blob('%PDF'))
     const wrapper = setup({ ...source, file_name: 'a.pdf', location: { kind: 'page', page: 3 } })
     await flushPromises()
-    expect(wrapper.find('iframe').attributes('src')).toBe('blob:test-pdf#page=3')
+    expect(wrapper.find('iframe').attributes('src')).toBe('blob:test-pdf#page=3&view=FitH&zoom=page-width')
     await wrapper.setProps({ source: null })
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:test-pdf')
     wrapper.unmount()

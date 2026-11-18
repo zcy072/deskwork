@@ -1,14 +1,14 @@
 """bash 超长输出:截断显示,完整内容落盘到 scratchpad。"""
 
 from app.sandbox.bash_handler import BashSession
-from app.sandbox.constants import OUTPUT_MAX_LINES
+from app.sandbox.constants import OUTPUT_MAX_CHARS, OUTPUT_MAX_LINES
 from app.sandbox.session_paths import SessionPaths
 
 
 def _session(tmp_path) -> BashSession:
     paths = SessionPaths.create("spill-test", sessions_root=tmp_path)
     paths.scratchpad.mkdir(parents=True)
-    return BashSession(paths, docker_client=object())
+    return BashSession(paths, manager_client=object())
 
 
 def test_short_output_untouched(tmp_path):
@@ -54,3 +54,20 @@ def test_spill_never_follows_planted_symlink(tmp_path):
     s._beautify_output([f"x{i}" for i in range(OUTPUT_MAX_LINES + 5)], [])
     assert victim.read_text(encoding="utf-8") == "keep"
     assert len(list(s.paths.scratchpad.glob("bash_stdout_1_*.txt"))) == 1
+
+
+def test_single_huge_line_is_capped_by_characters(tmp_path):
+    # 压缩 JSON / base64 只有一行,只按行数截不住,会把几 MB 塞给模型
+    s = _session(tmp_path)
+    line = "A" * (OUTPUT_MAX_CHARS * 10)
+    out = s._beautify_output([line], [])
+    assert len(out) < OUTPUT_MAX_CHARS + 1000
+    assert "Output truncated" in out
+    (spilled,) = s.paths.scratchpad.glob("bash_stdout_1_*.txt")
+    assert spilled.read_text(encoding="utf-8") == line
+
+
+def test_stderr_char_cap_keeps_tail(tmp_path):
+    s = _session(tmp_path)
+    out = s._beautify_output([], ["x" * OUTPUT_MAX_CHARS * 2 + "END"])
+    assert "END" in out and len(out) < OUTPUT_MAX_CHARS + 1000

@@ -2,6 +2,7 @@
 import { ref, watch } from 'vue'
 import { fetchFileBlob, fetchFileVersionBlob, listFileVersions, saveBlob, type FileVersion } from '@/api/client'
 import type { FileRef } from '@/types'
+import { decodeText } from '@/utils/decodeText'
 import { errMsg } from '@/utils/errors'
 import { fmtSize, toRelativePath } from '@/utils/files'
 import { diffLines, type DiffLine } from '@/utils/lineDiff'
@@ -77,7 +78,7 @@ async function compare(v: FileVersion) {
       diffNote.value = '文件较大,不做对比,请下载后查看'
       return
     }
-    const result = diffLines(await oldBlob.text(), await newBlob.text())
+    const result = diffLines(await decodeText(oldBlob), await decodeText(newBlob))
     if (mine !== seq) return
     if (!result) diffNote.value = '改动太多,不做逐行对比,请下载后查看'
     else if (result.every((l) => l.op === 'same')) diffNote.value = '内容与当前版本相同'

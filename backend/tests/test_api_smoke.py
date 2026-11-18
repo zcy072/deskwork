@@ -7,7 +7,7 @@ from app import app
 
 
 @pytest.fixture
-def client():
+def client(visible_sessions):
     # 不进入 lifespan,避免连接 Redis
     return TestClient(app)
 

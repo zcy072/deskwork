@@ -16,3 +16,37 @@ os.environ["DATABASE_URL"] = ""
 os.environ.pop("SANDBOX_MANAGER_URL", None)
 # 测试不写日志文件,免得往开发用的 app.log 里灌测试产生的报错
 os.environ["LOG_FILE"] = ""
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_registry(monkeypatch):
+    from app.runtime.sessions import sessions
+
+    monkeypatch.setattr(sessions, "_slots", {})
+    monkeypatch.setattr(sessions, "closing", False)
+
+
+@pytest.fixture
+async def run_db(tmp_path, monkeypatch):
+    """临时 SQLite:运行回执、消息都走真实的写库路径。"""
+    from app.config import settings
+    from app.db import close_db, init_db
+
+    monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path / "run-db"))
+    monkeypatch.setattr(settings, "DATABASE_URL", "")
+    await close_db()
+    await init_db()
+    yield
+    await close_db()
+
+
+@pytest.fixture
+async def visible_sessions(run_db):
+    """路由测试用:先建好这些会话,请求才能通过 _require_visible 的归属检查。"""
+    from app.db import repository
+
+    for sid in ("s", "s1", "vsess", "source-session", "preview-sess"):
+        await repository.ensure_conversation(sid, "seed")

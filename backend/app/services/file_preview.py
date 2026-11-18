@@ -9,12 +9,13 @@
 import asyncio
 import hashlib
 import shlex
-import shutil
 from collections import OrderedDict
 from contextlib import suppress
 from pathlib import Path
 
+from app.runtime.sessions import complete_before_cancelling, sessions
 from app.sandbox import CONTAINER_MANAGER
+from app.sandbox.host_files import open_regular, remove_tree
 from app.sandbox.session_paths import SessionPaths
 
 OFFICE_SUFFIXES = {".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".odt", ".odp", ".ods"}
@@ -53,7 +54,7 @@ def _locate(session_id: str, relative_path: str) -> tuple[SessionPaths, Path, st
     root = paths.session_root.resolve()
     # 与 /files/download 相同:对解析后的路径判断白名单,output/../scratchpad/x 不能绕过
     if not any(host.is_relative_to(root / d) for d in ALLOWED_DIRS):
-        raise ValueError("Invalid path")
+        raise ValueError("文件路径无效")
     if not host.is_file():
         raise FileNotFoundError(relative_path)
     st = host.stat()
@@ -62,9 +63,10 @@ def _locate(session_id: str, relative_path: str) -> tuple[SessionPaths, Path, st
     return paths, host, host.relative_to(root).as_posix()
 
 
-def _digest(host: Path) -> str:
+def _digest(root: Path, host: Path) -> str:
+    """文件在 agent 可写的目录里:不跟随符号链接,也不在 FIFO 上阻塞(会卡住 drain_previews)。"""
     h = hashlib.sha256()
-    with host.open("rb") as f:
+    with open_regular(root, host) as f:
         while chunk := f.read(1024 * 1024):
             h.update(chunk)
     return h.hexdigest()
@@ -100,11 +102,11 @@ async def _convert(session_id: str, rel: str, host: Path, digest: str) -> tuple[
                 raise PreviewError(f"读取转换结果失败:{exc}") from exc
         finally:
             # 结果已在内存缓存里;中间 PDF 留在 scratchpad 只会占配额、进快照
-            await asyncio.to_thread(shutil.rmtree, host_dir, True)
+            await asyncio.to_thread(remove_tree, paths.session_root, host_dir)
         if len(data) > MAX_PDF_BYTES:
             raise PreviewError("转换结果过大,请下载查看")
         try:
-            stable = await asyncio.to_thread(_digest, host) == digest
+            stable = await asyncio.to_thread(_digest, paths.session_root, host) == digest
         except OSError:
             stable = False
         return data, stable
@@ -112,9 +114,12 @@ async def _convert(session_id: str, rel: str, host: Path, digest: str) -> tuple[
 
 async def office_to_pdf(session_id: str, relative_path: str) -> bytes:
     """返回 PDF 字节。抛 ValueError / FileNotFoundError(请求有误)或 PreviewError(转换失败)。"""
-    _, host, rel = await asyncio.to_thread(_locate, session_id, relative_path)
+    handle = sessions.get(session_id)
+    if sessions.closing or (handle and handle.operation != "run"):
+        raise PreviewError("会话正在执行维护操作,请稍后再试")
+    paths, host, rel = await asyncio.to_thread(_locate, session_id, relative_path)
     try:
-        digest = await asyncio.to_thread(_digest, host)
+        digest = await asyncio.to_thread(_digest, paths.session_root, host)
     except OSError as exc:
         raise FileNotFoundError(relative_path) from exc
     key = (session_id, rel, digest)
@@ -123,6 +128,9 @@ async def office_to_pdf(session_id: str, relative_path: str) -> bytes:
         return _CACHE[key]
     task = _INFLIGHT.get(key)
     if task is None:
+        handle = sessions.get(session_id)
+        if sessions.closing or (handle and handle.operation != "run"):
+            raise PreviewError("会话正在执行维护操作,请稍后再试")
         task = asyncio.create_task(_convert(session_id, rel, host, digest))
         _INFLIGHT[key] = task
 
@@ -155,3 +163,18 @@ async def prewarm(session_id: str, relative_paths: list[str]) -> None:
         seen.add(rel)
         with suppress(ValueError, FileNotFoundError, PreviewError, OSError):
             await office_to_pdf(session_id, rel)
+
+
+async def drain_previews(session_id: str | None = None) -> None:
+    tasks = [
+        task for key, task in list(_INFLIGHT.items()) if session_id is None or key[0] == session_id
+    ]
+    if tasks:
+
+        async def drain():
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await complete_before_cancelling(asyncio.create_task(drain()))
+    for key in list(_CACHE):
+        if session_id is None or key[0] == session_id:
+            _CACHE.pop(key, None)

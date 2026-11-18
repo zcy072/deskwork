@@ -11,6 +11,10 @@ vi.mock('@/api/client', () => ({
       super(message)
     }
   },
+  SendUncertainError: class SendUncertainError extends Error {
+    constructor(public requestId: string, cause: unknown, public retryRejected = false) { super(String(cause)) }
+  },
+  getAcceptedRun: vi.fn(),
   sendMessage: vi.fn(),
   streamEvents: vi.fn(),
   cancelGeneration: vi.fn(),
@@ -49,12 +53,25 @@ beforeEach(() => {
   m.getUsage.mockRejectedValue(new Error('no usage'))
   m.getConversationAssets.mockRejectedValue(new Error('no assets'))
   m.getMessages.mockResolvedValue([])
+  m.getAcceptedRun.mockResolvedValue(null)
   m.getThreadStatus.mockResolvedValue(null)
   m.markConversationRead.mockResolvedValue(undefined)
   m.listSessionFiles.mockRejectedValue(new Error('no list'))
 })
 
 describe('send', () => {
+  it('只合并当前 Run 的事件,不会让其他 Run 的大序号吞掉正文', async () => {
+    m.sendMessage.mockResolvedValue('own-run')
+    m.streamEvents.mockReturnValue(packets(
+      { event: 'ai.token', run_id: 'other-run', seq: 100, data: { text: 'foreign' } },
+      { event: 'ai.token', run_id: 'own-run', seq: 1, data: { text: 'own answer' } },
+      { event: 'stream.end', run_id: 'own-run', seq: 2, data: { status: 'complete' } },
+    ))
+    const chat = useChatStore()
+    await chat.send('question', [])
+    expect(chat.messages.at(-1)?.parts).toEqual([{ type: 'text', text: 'own answer' }])
+    chat.dispose()
+  })
   it('成功删除会话清理草稿,删除失败保留草稿', async () => {
     const chat = useChatStore()
     chat.draftFor('A').text = '保留的草稿'
@@ -65,6 +82,20 @@ describe('send', () => {
     m.deleteConversation.mockResolvedValueOnce(undefined)
     await chat.removeConversation('A')
     expect(chat.draftFor('A')).toEqual({ text: '', files: [], lostFiles: [] })
+  })
+  it('删除正在看的会话后,右侧文件、计划和错误提示都清空', async () => {
+    const chat = useChatStore()
+    const files = { type: 'files', files: [{ file_name: 'r.pdf', container_path: '/workspace/output/r.pdf' }] }
+    m.getMessages.mockResolvedValue([{ ...row(1, 'assistant', 'x'), parts: [files] } as MessageRow])
+    await chat.openConversation('A')
+    expect(chat.sharedFiles.length).toBe(1)
+    chat.error = '旧错误'
+    m.deleteConversation.mockResolvedValueOnce(undefined)
+    await chat.removeConversation('A')
+    expect(chat.sessionId).not.toBe('A')
+    expect(chat.sharedFiles).toEqual([])
+    expect(chat.todos).toEqual([])
+    expect(chat.error).toBeNull()
   })
   it('流式内容写入助手消息并补上用户消息 id', async () => {
     m.sendMessage.mockResolvedValue('p1')
@@ -77,7 +108,7 @@ describe('send', () => {
     expect(chat.running).toBe(false)
     expect(chat.messages).toHaveLength(2)
     expect(chat.messages[1].parts).toEqual([{ type: 'text', text: '你好' }])
-    expect(chat.messages[1].status).toBe('completed')
+    expect(chat.messages[1].status).toBe('complete')
     expect(chat.messages[0].dbId).toBe(7)
   })
 
@@ -94,8 +125,8 @@ describe('send', () => {
   })
 
   it('网络错误但服务端已在生成时接回那一轮', async () => {
-    m.sendMessage.mockRejectedValue(new TypeError('Failed to fetch'))
-    m.getThreadStatus.mockResolvedValue({ status: 'running', prompt_id: 'p9' })
+    m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', 'Failed to fetch'))
+    m.getAcceptedRun.mockResolvedValue({ status: 'running', id: 'p9' })
     m.streamEvents.mockReturnValue(packets(token('回来了'), end))
     const chat = useChatStore()
 
@@ -107,7 +138,7 @@ describe('send', () => {
   })
 
   it('网络错误且服务端没有在生成时按未接受处理', async () => {
-    m.sendMessage.mockRejectedValue(new TypeError('Failed to fetch'))
+    m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', 'Failed to fetch'))
     m.getThreadStatus.mockResolvedValue(null)
     const chat = useChatStore()
     chat.messages = [{ id: 'a', role: 'user', parts: [{ type: 'text', text: '旧' }] }]
@@ -119,8 +150,9 @@ describe('send', () => {
   })
 
   it('网络错误、服务端已记下这条消息并跑完时算已接受', async () => {
-    m.sendMessage.mockRejectedValue(new TypeError('Failed to fetch'))
+    m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', 'Failed to fetch'))
     m.getThreadStatus.mockResolvedValue(null)
+    m.getAcceptedRun.mockResolvedValue({ id: 'p9', status: 'complete' })
     const rows = [
       { id: 5, role: 'user' as const, parts: [{ type: 'text' as const, text: '旧' }], status: 'done', rewindable: true },
       { id: 6, role: 'assistant' as const, parts: [], status: 'done', rewindable: false },
@@ -142,7 +174,7 @@ describe('send', () => {
   })
 
   it('网络错误、服务端最新的用户消息是发送前就有的时按未接受处理', async () => {
-    m.sendMessage.mockRejectedValue(new TypeError('Failed to fetch'))
+    m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', 'Failed to fetch'))
     m.getThreadStatus.mockResolvedValue(null)
     m.getMessages.mockResolvedValue([
       { id: 5, role: 'user', parts: [{ type: 'text', text: '新' }], status: 'done', rewindable: true },
@@ -152,6 +184,38 @@ describe('send', () => {
 
     expect(await chat.send('新', [])).toBe(false)
     expect(chat.messages.map((x) => x.id)).toEqual(['5'])
+  })
+
+  it('重试被拒绝后按原请求 ID 查回执并接回那一轮', async () => {
+    m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', new Error('busy'), true))
+    m.getAcceptedRun.mockResolvedValueOnce(null).mockResolvedValueOnce({ status: 'running', id: 'p9' })
+    m.streamEvents.mockReturnValue(packets(token('回来了'), end))
+    const chat = useChatStore()
+
+    expect(await chat.send('问', [])).toBe(true)
+
+    expect(m.getAcceptedRun).toHaveBeenCalledWith(expect.anything(), 'request-1')
+    expect(m.streamEvents).toHaveBeenCalledWith(expect.anything(), 'p9', expect.anything())
+    expect(chat.error).toBeNull()
+  })
+
+  it('重试被拒绝且回执一直查不到时保持未知,不把消息退回', async () => {
+    vi.useFakeTimers()
+    try {
+      m.sendMessage.mockRejectedValue(new api.SendUncertainError('request-1', new Error('busy'), true))
+      const chat = useChatStore()
+      chat.messages = [{ id: 'a', role: 'user', parts: [{ type: 'text', text: '旧' }] }]
+
+      const sent = chat.send('新', [])
+      await vi.runAllTimersAsync()
+
+      expect(await sent).toBe(true)
+      expect(m.getAcceptedRun.mock.calls.length).toBeGreaterThan(1)
+      expect(chat.messages.map((x) => x.parts)).toContainEqual([{ type: 'text', text: '新' }])
+      expect(chat.error).toContain('无法确认')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('服务端明确拒绝时不查线程状态', async () => {
@@ -206,6 +270,85 @@ describe('send', () => {
 })
 
 describe('openConversation', () => {
+  it.each(['partial', 'no-assistant'])('补齐历史与状态查询之间完成的回答: %s', async (initial) => {
+    const user = { ...row(1, 'user', 'q'), prompt_id: 'p' }
+    const partial = { ...row(2, 'assistant', 'partial'), prompt_id: 'p', status: 'running' }
+    const complete = { ...partial, parts: [{ type: 'text' as const, text: 'complete answer' }], status: 'complete' }
+    m.getMessages.mockResolvedValueOnce(initial === 'partial' ? [user, partial] : [user])
+      .mockResolvedValue([user, complete])
+    m.getThreadStatus.mockResolvedValue({ status: 'complete', prompt_id: null })
+    const chat = useChatStore()
+    await chat.openConversation('S')
+    expect(chat.messages[1].parts).toEqual(complete.parts)
+    expect(chat.messages[1].status).toBe('complete')
+    expect(chat.running).toBe(false)
+    expect(m.getMessages).toHaveBeenCalledTimes(2)
+    chat.dispose()
+  })
+
+  it('补读最终历史时切换会话,旧回答不覆盖新会话', async () => {
+    let release!: (rows: MessageRow[]) => void
+    m.getMessages.mockResolvedValueOnce([row(1, 'assistant', 'partial')])
+      .mockImplementationOnce(() => new Promise(r => { release = r }))
+      .mockResolvedValue([row(3, 'assistant', 'B answer')])
+    m.getThreadStatus.mockResolvedValue({ status: 'complete', prompt_id: null })
+    const chat = useChatStore()
+    const opening = chat.openConversation('A')
+    await vi.waitFor(() => expect(release).toBeDefined())
+    await chat.openConversation('B')
+    release([row(2, 'assistant', 'A complete')])
+    await opening
+    expect(chat.sessionId).toBe('B')
+    expect(chat.messages[0].parts).toEqual([{ type: 'text', text: 'B answer' }])
+    chat.dispose()
+  })
+
+  it('补读最终历史期间发送新消息,旧快照不覆盖正在生成的回答', async () => {
+    let release!: (rows: MessageRow[]) => void
+    m.getMessages.mockResolvedValueOnce([row(1, 'user', 'old')])
+      .mockImplementationOnce(() => new Promise(r => { release = r }))
+      .mockResolvedValue([row(1, 'user', 'old'), row(2, 'user', 'new')])
+    m.getThreadStatus.mockResolvedValue({ status: 'complete', prompt_id: null })
+    let finishStream!: () => void
+    m.sendMessage.mockResolvedValue('new-run')
+    m.streamEvents.mockImplementation(async function* () {
+      yield token('new answer')
+      await new Promise<void>(r => { finishStream = r })
+      yield end
+    })
+    const chat = useChatStore()
+    const opening = chat.openConversation('S')
+    await vi.waitFor(() => expect(release).toBeDefined())
+    const sending = chat.send('new', [])
+    await vi.waitFor(() => expect(finishStream).toBeDefined())
+    release([row(1, 'assistant', 'old complete')])
+    await opening
+    expect(chat.running).toBe(true)
+    expect(chat.messages.at(-1)?.parts).toEqual([{ type: 'text', text: 'new answer' }])
+    finishStream()
+    await sending
+    chat.dispose()
+  })
+
+  it('补读历史期间新一轮已经完成,迟到的旧快照仍不能覆盖它', async () => {
+    let release!: (rows: MessageRow[]) => void
+    m.getMessages.mockResolvedValueOnce([row(1, 'user', 'old')])
+      .mockImplementationOnce(() => new Promise(r => { release = r }))
+      .mockResolvedValue([row(1, 'user', 'old'), row(2, 'user', 'new')])
+    m.getThreadStatus.mockResolvedValue({ status: 'complete', prompt_id: null })
+    m.sendMessage.mockResolvedValue('new-run')
+    m.streamEvents.mockReturnValue(packets(token('new answer'), end))
+    const chat = useChatStore()
+    const opening = chat.openConversation('S')
+    await vi.waitFor(() => expect(release).toBeDefined())
+    await chat.send('new', [])
+    expect(chat.running).toBe(false)
+    release([row(1, 'assistant', 'stale answer')])
+    await opening
+    expect(chat.messages.at(-1)?.parts).toEqual([{ type: 'text', text: 'new answer' }])
+    chat.dispose()
+  })
+
   it('较早发出的请求后返回时不会覆盖后点开的会话', async () => {
     let releaseA!: (rows: MessageRow[]) => void
     m.getMessages.mockImplementation((id: string) =>
@@ -403,7 +546,7 @@ describe('error status and delete during run', () => {
     )
     const chat = useChatStore()
     await chat.send('hi', [])
-    expect(chat.messages[1].status).toBe('completed')
+    expect(chat.messages[1].status).toBe('complete')
     expect(chat.messages[1].warningText).toBe('保存失败')
     expect(chat.messages[1].errorText).toBeUndefined()
     expect(chat.error).toBeNull()
@@ -420,7 +563,7 @@ describe('error status and delete during run', () => {
         yield end
       })(),
     )
-    m.cancelGeneration.mockResolvedValue()
+    m.cancelGeneration.mockResolvedValue(true)
     const chat = useChatStore()
     const p = chat.send('hi', [])
     await vi.waitFor(() => expect(chat.messages[1]?.parts.length).toBe(1))
@@ -428,6 +571,32 @@ describe('error status and delete during run', () => {
     release()
     await p
     expect(chat.messages[1].status).toBe('cancelled')
+  })
+
+  it('停止后宽限期到被强行中止时,按服务端历史校正状态而不是一律显示已停止', async () => {
+    vi.useFakeTimers()
+    try {
+      m.sendMessage.mockResolvedValue('p1')
+      m.streamEvents.mockImplementation((_sid, _pid, signal) =>
+        (async function* () {
+          yield token('a')
+          await new Promise<void>((r) => signal?.addEventListener('abort', () => r()))
+        })(),
+      )
+      m.cancelGeneration.mockResolvedValue(true)
+      const chat = useChatStore()
+      const p = chat.send('hi', [])
+      await vi.waitFor(() => expect(chat.messages[1]?.parts.length).toBe(1))
+      // 服务端其实已经正常完成
+      m.getMessages.mockResolvedValue([row(1, 'user', 'hi'), row(2, 'assistant', '完整回答')])
+      await chat.stop()
+      await vi.advanceTimersByTimeAsync(5000)
+      await p
+      expect(chat.messages.map((x) => x.status)).toEqual(['complete', 'complete'])
+      expect(chat.messages[1].parts).toEqual([{ type: 'text', text: '完整回答' }])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('运行中删除当前会话会中止流、复位状态且不对新会话同步', async () => {
@@ -482,7 +651,7 @@ describe('error status and delete during run', () => {
     expect(chat.error).toBe('删除失败')
     release()
     await p
-    expect(chat.messages[1].status).toBe('completed')
+    expect(chat.messages[1].status).toBe('complete')
   })
 
   it('删除请求期间服务端取消导致流结束时,不再同步被删的会话', async () => {
@@ -679,6 +848,120 @@ describe('stop', () => {
     expect(chat.error).toBe('网络')
     release()
     await p
+  })
+})
+
+describe('stop 的边界', () => {
+  it('取消请求等待期间切到另一个生成中的会话,不会中止那边的流', async () => {
+    try {
+      const chat = useChatStore()
+      m.sendMessage.mockResolvedValue('p1')
+      m.streamEvents.mockImplementationOnce((_s, _p, sig) =>
+        (async function* () {
+          yield token('a')
+          await new Promise<void>((r) => sig.addEventListener('abort', () => r()))
+        })(),
+      )
+      const p = chat.send('hi', [])
+      await vi.waitFor(() => expect(chat.messages[1]?.parts.length).toBe(1))
+      let releaseCancel!: (v: boolean) => void
+      m.cancelGeneration.mockImplementation(() => new Promise((r) => (releaseCancel = r)))
+      const stopping = chat.stop()
+      // 另一个会话 B 仍在生成,打开后接上它的流
+      let bSignal!: AbortSignal
+      m.getMessages.mockResolvedValue([row(1, 'user', 'q')])
+      m.getThreadStatus.mockResolvedValue({ status: 'running', prompt_id: 'pb' })
+      m.streamEvents.mockImplementationOnce((_s, _p, sig) => {
+        bSignal = sig
+        return (async function* () {
+          yield token('b')
+          await new Promise<void>((r) => sig.addEventListener('abort', () => r()))
+        })()
+      })
+      const opening = chat.openConversation('B') // 接回 B 的流会一直挂着
+      await vi.waitFor(() => expect(bSignal).toBeDefined())
+      vi.useFakeTimers()
+      releaseCancel(true)
+      await stopping
+      await vi.advanceTimersByTimeAsync(6000)
+      expect(bSignal.aborted).toBe(false)
+      expect(chat.cancelling).toBe(false)
+      chat.dispose()
+      await Promise.all([p, opening])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('上传中(服务端尚未接受)不发取消请求', async () => {
+    let accept!: (id: string) => void
+    m.sendMessage.mockImplementation(() => new Promise((r) => (accept = r)))
+    m.streamEvents.mockReturnValue(packets(token('a'), end))
+    const chat = useChatStore()
+    const p = chat.send('hi', [])
+    await vi.waitFor(() => expect(accept).toBeDefined())
+    expect(chat.preparing).toBe(true)
+    await chat.stop()
+    expect(m.cancelGeneration).not.toHaveBeenCalled()
+    accept('p1')
+    await p
+    expect(chat.preparing).toBe(false)
+  })
+
+  it('服务端回复没有可停止的任务时不强行中止本地流', async () => {
+    vi.useFakeTimers()
+    try {
+      m.sendMessage.mockResolvedValue('p1')
+      let signal!: AbortSignal
+      let release!: () => void
+      const gate = new Promise<void>((r) => (release = r))
+      m.streamEvents.mockImplementation((_s, _p, sig) => {
+        signal = sig
+        return (async function* () {
+          yield token('a')
+          await gate
+          yield end
+        })()
+      })
+      m.cancelGeneration.mockResolvedValue(false)
+      const chat = useChatStore()
+      const p = chat.send('hi', [])
+      await vi.waitFor(() => expect(chat.messages[1]?.parts.length).toBe(1))
+      await chat.stop()
+      expect(chat.cancelling).toBe(false)
+      await vi.advanceTimersByTimeAsync(6000)
+      expect(signal.aborted).toBe(false)
+      release()
+      await p
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('没有输出就被停止的一轮保留"已停止"标记', async () => {
+    m.sendMessage.mockResolvedValue('p1')
+    m.streamEvents.mockReturnValue(packets({ event: 'stream.end', data: { status: 'cancelled' } }))
+    const chat = useChatStore()
+    await chat.send('hi', [])
+    expect(chat.messages.length).toBe(2)
+    expect(chat.messages[1].status).toBe('cancelled')
+  })
+})
+
+describe('openConversation 点回当前会话', () => {
+  it('作废正在加载的切换', async () => {
+    let release!: (rows: MessageRow[]) => void
+    m.getMessages.mockImplementationOnce(() => new Promise((r) => (release = r)))
+    m.getThreadStatus.mockResolvedValue({ status: 'complete', prompt_id: null })
+    const chat = useChatStore()
+    const cur = chat.sessionId
+    const opening = chat.openConversation('A')
+    await vi.waitFor(() => expect(release).toBeDefined())
+    await chat.openConversation(cur)
+    expect(chat.loadingConversation).toBe(false)
+    release([row(1, 'assistant', 'A')])
+    await opening
+    expect(chat.sessionId).toBe(cur)
   })
 })
 
@@ -971,5 +1254,17 @@ describe('removeFile', () => {
     await chat.removeFile(doc)
     await chat.openConversation('c2')
     expect(chat.sharedFiles).toEqual([doc])
+  })
+})
+
+describe('reloadMessages', () => {
+  it('按最早已加载的 id 重新载入,不按条数取(条数可能超过接口 limit 上限)', async () => {
+    m.getMessages.mockResolvedValueOnce([row(1001, 'user', 'q'), row(1002, 'assistant', 'a')])
+    m.getThreadStatus.mockResolvedValueOnce({ status: 'complete' } as never)
+    m.getMessages.mockResolvedValue([row(1001, 'user', 'q'), row(1002, 'assistant', 'a')])
+    const chat = useChatStore()
+    await chat.openConversation('c1')
+    const calls = m.getMessages.mock.calls
+    expect(calls[calls.length - 1]).toEqual(['c1', undefined, undefined, 1001])
   })
 })

@@ -22,7 +22,7 @@ def test_health_is_public():
     assert client.get("/health").status_code == 200
 
 
-@pytest.mark.parametrize("path", ["/provision", "/remove", "/exec", "/file"])
+@pytest.mark.parametrize("path", ["/provision", "/remove", "/exec"])
 def test_requires_token(path):
     body = {"container": "sandbox", "path": "/sandbox_data/sessions/a", "script": "id"}
     assert client.post(path, json=body).status_code == 401
@@ -44,7 +44,7 @@ def test_rejects_other_containers():
     ],
 )
 def test_rejects_paths_outside_sessions(path):
-    for endpoint in ("/remove", "/provision", "/file"):
+    for endpoint in ("/remove", "/provision"):
         body = {"container": "sandbox", "path": path}
         assert client.post(endpoint, json=body, headers=AUTH).status_code == 400
 
@@ -159,59 +159,6 @@ def test_spawn_over_limit_closes_with_4429(monkeypatch):
     assert "4429" in repr(exc.value) or getattr(exc.value, "code", None) == 4429
 
 
-def _local_exec(monkeypatch, root):
-    """把 docker exec 换成本机 sh,并把 SESSIONS_ROOT 指向临时目录,直接测 /file 的脚本。"""
-    import asyncio
-
-    monkeypatch.setattr(manager, "SESSIONS_ROOT", f"{root}/sessions/")
-
-    async def fake_exec(user, script, timeout=90):
-        proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        out, err = await proc.communicate()
-        return proc.returncode or 0, out, err
-
-    monkeypatch.setattr(manager, "_docker_exec", fake_exec)
-
-
-def test_file_reads_regular_file_and_in_session_symlink(tmp_path, monkeypatch):
-    _local_exec(monkeypatch, tmp_path)
-    out = tmp_path / "sessions" / "a" / "output"
-    out.mkdir(parents=True)
-    (out / "f.txt").write_text("hello")
-    (out / "ok_link").symlink_to(out / "f.txt")
-    for name in ("f.txt", "ok_link"):
-        resp = client.post(
-            "/file",
-            json={"container": "sandbox", "path": f"{tmp_path}/sessions/a/output/{name}"},
-            headers=AUTH,
-        )
-        assert resp.status_code == 200 and resp.content == b"hello"
-
-
-def test_file_blocks_symlink_to_other_session_or_skills(tmp_path, monkeypatch):
-    _local_exec(monkeypatch, tmp_path)
-    mine = tmp_path / "sessions" / "a" / "output"
-    other = tmp_path / "sessions" / "b" / "output"
-    skills = tmp_path / "default_skills"
-    for d in (mine, other, skills):
-        d.mkdir(parents=True)
-    (other / "secret.txt").write_text("secret")
-    (skills / "s.md").write_text("skill")
-    (mine / "to_other").symlink_to(other / "secret.txt")
-    (mine / "to_skills").symlink_to(skills / "s.md")
-    (mine / "dir_link").symlink_to(other)
-    for name in ("to_other", "to_skills", "dir_link/secret.txt"):
-        resp = client.post(
-            "/file",
-            json={"container": "sandbox", "path": f"{tmp_path}/sessions/a/output/{name}"},
-            headers=AUTH,
-        )
-        assert resp.status_code == 403, name
-        assert b"secret" not in resp.content
-
-
 def test_exec_script_is_wrapped_in_container_timeout(monkeypatch):
     import asyncio
 
@@ -238,27 +185,19 @@ def test_exec_script_is_wrapped_in_container_timeout(monkeypatch):
     assert args[i : i + 3] == ("timeout", "-s", "KILL") and args[i + 3] == "1"
 
 
-def test_file_too_large_is_rejected(tmp_path, monkeypatch):
-    _local_exec(monkeypatch, tmp_path)
-    monkeypatch.setattr(manager, "MAX_FILE_BYTES", 10)
-    out = tmp_path / "sessions" / "a" / "output"
-    out.mkdir(parents=True)
-    (out / "small.txt").write_bytes(b"x" * 10)
-    (out / "big.txt").write_bytes(b"x" * 11)
-    for name, status in (("small.txt", 200), ("big.txt", 413), ("missing.txt", 404)):
-        resp = client.post(
-            "/file",
-            json={"container": "sandbox", "path": f"{tmp_path}/sessions/a/output/{name}"},
-            headers=AUTH,
-        )
-        assert resp.status_code == status, name
+def _exit_code(code):
+    from types import SimpleNamespace
+
+    async def wait():
+        return code
+
+    return SimpleNamespace(wait=wait)
 
 
 @pytest.mark.parametrize("disconnect", [False, True])
 def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
     """结束时按本次的唯一标记杀 bwrap,不按会话目录匹配(会误杀同会话并行的 bwrap)。"""
     import asyncio
-    from types import SimpleNamespace
 
     calls = []
 
@@ -292,13 +231,16 @@ def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
 
     async def fake_exec(*args, **_kw):
         calls.append(args)
-        return FakeProc() if "-i" in args else SimpleNamespace(wait=lambda: asyncio.sleep(0))
+        if "-i" in args:
+            return FakeProc()
+        # pkill 杀掉了(0);pgrep 找不到(1)表示确认已停止
+        return _exit_code(0 if "pkill" in args else 1)
 
     monkeypatch.setattr(manager.asyncio, "create_subprocess_exec", fake_exec)
     spec = {
         "container": "sandbox",
         "user": "agent",
-        "argv": ["bwrap", "--bind", "/sandbox_data/sessions/s1/output", "/w", "bash"],
+        "argv": _shell_argv("s1"),
     }
     with client.websocket_connect("/spawn", headers=AUTH) as ws:
         ws.send_text(json.dumps(spec))
@@ -306,13 +248,77 @@ def test_spawn_kills_only_its_own_bwrap(monkeypatch, disconnect):
             ws.close()
         else:
             ws.send_bytes(b"\x00echo hi\n")  # stdin 已断:应当照常清理而不是抛异常
-            assert json.loads(ws.receive_text()) == {"exit": -15}
+            assert json.loads(ws.receive_text()) == {"exit": -15, "stopped": True}
     spawned, killer = calls[0], calls[1]
-    bwrap = spawned[spawned.index("bwrap") :]
+    # bwrap 由一层 sh 托着(不直接当 docker exec 的进程,见 manager 注释)
+    i = spawned.index("bwrap")
+    assert spawned[:i] == (
+        "docker",
+        "exec",
+        "-i",
+        "-u",
+        manager.AGENT_USER,
+        manager.CONTAINER,
+        "sh",
+        "-c",
+        manager.SPAWN_WRAPPER,
+        "sh",
+    )
+    assert "exec" not in manager.SPAWN_WRAPPER
+    bwrap = spawned[i:]
     assert bwrap[1:3] == ("--setenv", "DESKWORK_SPAWN_ID")
     assert bwrap[4:] == tuple(spec["argv"][1:])
     assert killer[-1] == f"^bwrap --setenv DESKWORK_SPAWN_ID {bwrap[3]} "
     assert "s1" not in killer[-1]
+
+
+@pytest.mark.parametrize(
+    ("pkill", "pgrep", "stopped"),
+    [(0, 1, True), (1, 1, True), (2, 1, False), (0, 0, False)],
+)
+def test_spawn_receipt_reports_confirmed_stop(monkeypatch, pkill, pgrep, stopped):
+    """R12:pkill 失败或 pgrep 仍找得到进程时,回执不能声称已停止。"""
+    import asyncio
+
+    monkeypatch.setattr(manager, "STOP_CONFIRM_POLLS", 2)
+    monkeypatch.setattr(manager, "STOP_CONFIRM_INTERVAL", 0)
+
+    class FakeStream:
+        async def read(self, _n):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = None
+            self.stdout, self.stderr = FakeStream(), FakeStream()
+            self._done = asyncio.Event()
+
+        async def wait(self):
+            await self._done.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self._done.set()
+
+        kill = terminate
+
+    async def fake_exec(*args, **_kw):
+        if "-i" in args:
+            return FakeProc()
+        return _exit_code(pkill if "pkill" in args else pgrep)
+
+    monkeypatch.setattr(manager.asyncio, "create_subprocess_exec", fake_exec)
+    spec = {
+        "container": "sandbox",
+        "user": "agent",
+        "argv": _shell_argv("s1"),
+    }
+    with client.websocket_connect("/spawn", headers=AUTH) as ws:
+        ws.send_text(json.dumps(spec))
+        ws.send_text("terminate")
+        assert json.loads(ws.receive_text()) == {"exit": -15, "stopped": stopped}
 
 
 def test_spawn_handshake_timeout_releases_slot(monkeypatch):
@@ -324,3 +330,85 @@ def test_spawn_handshake_timeout_releases_slot(monkeypatch):
             ws.receive_text()
         assert getattr(exc.value, "code", None) == 4400
     assert limiter.active == 0
+
+
+def test_file_endpoint_removed():
+    """/file 先 realpath 再读,中间可被换成指向其他会话的链接;交付只走宿主侧 O_NOFOLLOW。"""
+    body = {"container": "sandbox", "path": "/sandbox_data/sessions/a/output/f"}
+    assert client.post("/file", json=body, headers=AUTH).status_code in (404, 405)
+
+
+def _shell_argv(session="abc", readonly=False):
+    from app.sandbox import bwrap
+    from app.sandbox.constants import SESSION_ROOT
+    from app.sandbox.session_paths import SessionPaths
+
+    return bwrap.shell_argv(
+        SessionPaths(session, SESSION_ROOT / session, "/workspace"), readonly=readonly
+    )
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_spawn_accepts_backend_shell_argv(readonly):
+    """后端 bwrap.shell_argv 改了而 manager 白名单没跟上,这里会先失败。"""
+    assert manager.spawn_argv_problem(_shell_argv(readonly=readonly)) == ""
+
+
+def _replace(argv, old, new):
+    i = next(i for i in range(len(argv)) if argv[i : i + len(old)] == old)
+    return argv[:i] + new + argv[i + len(old) :]
+
+
+_S = "/sandbox_data/sessions"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda a: _replace(a, ["--ro-bind", "/etc", "/etc"], ["--bind", "/", "/etc"]),
+        lambda a: _replace(a, ["--unshare-pid"], []),
+        lambda a: _replace(a, ["--clearenv"], []),
+        lambda a: _replace(a, ["--bind", f"{_S}/abc/output"], ["--bind", f"{_S}/other/output"]),
+        lambda a: _replace(a, ["--ro-bind", f"{_S}/abc/uploads"], ["--bind", f"{_S}/abc/uploads"]),
+        lambda a: _replace(a, ["--bind", f"{_S}/abc/output"], ["--bind", f"{_S}/abc/.."]),
+        lambda a: _replace(a, ["--setenv", "HOME"], ["--setenv", "LD_PRELOAD"]),
+        lambda a: _replace(a, ["--proc", "/proc"], ["--share-net"]),
+        lambda a: a[:-3] + ["sh", "-c", "id"],
+        lambda a: a[:-3],
+    ],
+)
+def test_spawn_rejects_altered_argv(mutate):
+    assert manager.spawn_argv_problem(mutate(_shell_argv())) != ""
+
+
+def test_spawn_rejects_altered_argv_over_websocket():
+    argv = _replace(_shell_argv(), ["--unshare-pid"], [])
+    with client.websocket_connect("/spawn", headers=AUTH) as ws:
+        ws.send_text(json.dumps({"container": "sandbox", "user": "agent", "argv": argv}))
+        with pytest.raises(Exception):  # noqa: B017 - 4400 关闭
+            ws.receive_text()
+
+
+@pytest.mark.parametrize(
+    "path", ["/sandbox_data/sessions/abc/output", "/sandbox_data/sessions/a b"]
+)
+def test_root_ops_only_accept_session_dir(path):
+    for endpoint in ("/remove", "/provision"):
+        body = {"container": "sandbox", "path": path}
+        assert client.post(endpoint, json=body, headers=AUTH).status_code == 400
+
+
+def test_provision_uses_nofollow_script(monkeypatch):
+    seen = []
+
+    async def fake_exec(user, script, timeout=90):
+        seen.append((user, script))
+        return 0, b"", b""
+
+    monkeypatch.setattr(manager, "_docker_exec", fake_exec)
+    body = {"container": "sandbox", "path": "/sandbox_data/sessions/abc"}
+    assert client.post("/provision", json=body, headers=AUTH).status_code == 200
+    user, script = seen[0]
+    assert user == "root" and "O_NOFOLLOW" in script and "fchown" in script
+    assert not any(w in script.split() for w in ("chown", "chmod"))
+    assert script.endswith(" abc")

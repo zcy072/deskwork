@@ -11,10 +11,10 @@ from httpx import ASGITransport, AsyncClient
 from app import app
 from app.api.routes import stream
 from app.config import settings
-from app.db import close_db, init_db, repository
+from app.db import close_db, init_db
 from app.sandbox.session_paths import SessionPaths
 from app.services import session_export
-from app.services.history import TurnRecorder, persist_assistant_turn, persist_user_turn
+from tests.history_seed import seed_turn
 
 
 @pytest.fixture
@@ -128,17 +128,14 @@ def test_file_count_limit(paths, tmp_path, monkeypatch):
 
 
 async def _seed(owner: str = ""):
-    await repository.ensure_conversation("s", "你好", owner=owner)
-    await persist_user_turn(
+    await seed_turn(
         "s",
         "p1",
         "你好",
-        [{"file_name": "a.txt", "container_path": "/workspace/uploads/a.txt"}],
-        owner,
+        "嗨",
+        owner=owner,
+        files=[{"file_name": "a.txt", "container_path": "/workspace/uploads/a.txt"}],
     )
-    r = TurnRecorder()
-    r.record("ai.token", {"text": "嗨"})
-    await persist_assistant_turn("s", "p1", r, "complete")
 
 
 @pytest.fixture
@@ -158,7 +155,9 @@ async def test_export_endpoint_returns_zip(db, client_paths):
     conv = json.loads(zf.read("conversation.json"))
     assert [m["role"] for m in conv["messages"]] == ["user", "assistant"]
     assert conv["messages"][0]["attachments"][0]["file_name"] == "a.txt"
-    assert json.loads(zf.read("manifest.json"))["missing"] == []
+    manifest = json.loads(zf.read("manifest.json"))
+    assert manifest["missing"] == [] and "checkpoint" not in manifest
+    assert "checkpoint.json" not in zf.namelist()
     assert zf.read("files/uploads/a.txt") == b"hello"
 
 
@@ -170,7 +169,7 @@ async def test_export_endpoint_unknown_session_404(db, client_paths):
 
 async def test_export_endpoint_blocked_while_running(db, client_paths, monkeypatch):
     await _seed()
-    monkeypatch.setattr(stream, "get_active_prompt_id", lambda _sid: "p1")
+    stream.sessions.reserve("s")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         r = await c.get("/files/export", params={"session_id": "s"})
     assert r.status_code == 409

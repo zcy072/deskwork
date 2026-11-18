@@ -12,7 +12,7 @@ from app.sandbox.session_paths import SessionPaths
 def _session(tmp_path) -> BashSession:
     paths = SessionPaths.create("upload-test", sessions_root=tmp_path / "sessions")
     paths.uploads.mkdir(parents=True)
-    return BashSession(paths, docker_client=object())
+    return BashSession(paths, manager_client=object())
 
 
 async def test_upload_written_with_fixed_mode(tmp_path):

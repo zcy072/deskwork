@@ -198,6 +198,8 @@ async def test_middleware_prepends_block_to_multimodal_message(db):
     seen = []
 
     class Req:
+        runtime = None
+
         def __init__(self, messages):
             self.messages = messages
 
@@ -253,6 +255,11 @@ async def test_capabilities_reports_flags(monkeypatch):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         body = (await c.get("/capabilities")).json()
     assert body["memory"] is True and "mcp_servers" in body
+    assert body["upload_limits"] == {
+        "max_files": settings.UPLOAD_MAX_FILES,
+        "max_file_mb": settings.UPLOAD_MAX_FILE_MB,
+        "max_total_mb": settings.UPLOAD_MAX_TOTAL_MB,
+    }
 
 
 async def test_memory_and_capabilities_require_api_key(db, monkeypatch):
@@ -299,6 +306,8 @@ async def test_middleware_touches_only_matched_and_once_per_turn(db, monkeypatch
     from langchain_core.messages import HumanMessage
 
     class Req:
+        runtime = None
+
         def __init__(self, messages):
             self.messages = messages
 

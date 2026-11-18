@@ -4,14 +4,12 @@
     POST /provision  修正会话目录的属主与权限(root)
     POST /remove     删除会话目录(root)
     POST /exec       以 agent 用户执行一次性脚本
-    POST /file       读取容器内文件(agent 用户)
     WS   /spawn      以 agent 用户启动 bwrap 交互进程,双向转发 stdin/stdout/stderr
 
-约束:容器名固定;路径必须落在 /sandbox_data/sessions/ 下;spawn 的 argv[0] 必须是 bwrap;
+约束:容器名固定;root 操作的路径只能是 /sandbox_data/sessions/<id>;spawn 的 bwrap 参数逐项按白名单校验;
 所有请求需 Bearer Token。后端被攻破时,攻击者拿不到 docker.sock 的完整权限,但仍能在沙箱容器内
-以 agent 用户执行任意脚本(/exec)、以 bwrap 参数启动进程(/spawn,argv 只校验首项,未逐项校验)。
+以 agent 用户执行任意脚本(/exec,不在 bwrap 内,能看到所有会话目录)。/spawn 只能启动会话 shell 这一种形状。
 这些操作都限制在无网络、cap_drop ALL、只读根的沙箱容器里,不能控制宿主机 docker。
-/file 会对路径做 realpath,真实路径必须仍在同一会话目录内(拒绝指向别的会话或 default_skills 的符号链接)。
 
 限流:同时在跑的 docker exec 数和同时在线的 spawn 会话数各有上限,超限直接拒绝(HTTP 429 /
 WebSocket 4429),不排队。审计:每个操作写一行 JSON 日志(操作、会话、结果、耗时),脚本只记
@@ -25,6 +23,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import secrets
 import shlex
 import time
@@ -34,7 +33,6 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
-    Response,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -43,12 +41,42 @@ from pydantic import BaseModel
 CONTAINER = os.environ.get("SANDBOX_CONTAINER", "sandbox")
 TOKEN = os.environ.get("SANDBOX_MANAGER_TOKEN", "")
 SESSIONS_ROOT = "/sandbox_data/sessions/"
+SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 AGENT_USER = "agent"
 EXEC_TIMEOUT_SEC = 90
-MAX_FILE_BYTES = 200 * 1024 * 1024
 MAX_CONCURRENT_EXEC = int(os.environ.get("MANAGER_MAX_EXEC", "16"))
 MAX_CONCURRENT_SPAWN = int(os.environ.get("MANAGER_MAX_SPAWN", "32"))
 SPAWN_HANDSHAKE_TIMEOUT = 10.0
+
+# /spawn 用 sh 托着 bwrap,参数经 "$@" 原样转交。sh 自己不能 exec 成 bwrap
+# (那样 --die-with-parent 的父进程又跑到容器外了),末尾的 exit $? 也防止
+# 某些 sh 把最后一条命令 exec 掉。
+SPAWN_WRAPPER = '"$@"; exit $?'
+# 杀掉 bwrap 后轮询确认进程消失:SIGKILL 是异步的
+STOP_CONFIRM_POLLS = 20
+STOP_CONFIRM_INTERVAL = 0.1
+
+# /provision 的容器内脚本。只改顶层目录:后端与 agent 同为 UID 1000,目录里的文件属主本来就可读写;
+# 递归改权限会随文件数变慢,还会给历史版本和快照加上可执行位
+PROVISION_PY = f"""
+import os, pwd, sys
+NOFOLLOW = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+agent = pwd.getpwnam({AGENT_USER!r})
+sessions = os.open({SESSIONS_ROOT!r}, NOFOLLOW)
+root = os.open(sys.argv[1], NOFOLLOW, dir_fd=sessions)
+try:
+    os.mkdir("snapshots", 0o700, dir_fd=root)
+except FileExistsError:
+    pass
+for name, mode, give in (
+    (None, 0o775, False), ("uploads", 0o775, False), ("output", 0o777, True),
+    ("scratchpad", 0o777, True), ("snapshots", 0o700, True),
+):
+    fd = root if name is None else os.open(name, NOFOLLOW, dir_fd=root)
+    if give:
+        os.fchown(fd, agent.pw_uid, agent.pw_gid)
+    os.fchmod(fd, mode)
+"""
 
 # 通道前缀:二进制帧首字节标识流
 CH_STDIN, CH_STDOUT, CH_STDERR = 0, 1, 2
@@ -123,10 +151,81 @@ def _check_container(name: str) -> None:
 
 
 def _check_session_path(path: str) -> str:
+    """只接受 /sandbox_data/sessions/<会话 id> 这一层:root 操作不需要更深的路径。"""
     normalized = posixpath.normpath(path)
-    if not normalized.startswith(SESSIONS_ROOT) or normalized == SESSIONS_ROOT.rstrip("/"):
-        raise HTTPException(status_code=400, detail="Path must be inside the sessions directory")
+    if not normalized.startswith(SESSIONS_ROOT) or not SESSION_ID.fullmatch(
+        normalized[len(SESSIONS_ROOT) :]
+    ):
+        raise HTTPException(status_code=400, detail="Path must be a session directory")
     return normalized
+
+
+# /spawn 的 bwrap 参数白名单,和 backend/app/sandbox/bwrap.py::shell_argv 对应。
+# 不逐项校验的话,拿到 token 的人可以 --bind / /x 把整个容器挂进来,或省掉 --unshare-pid 等隔离项。
+_SYSTEM_RO = {"/usr": "/usr", "/lib": "/lib", "/lib64": "/lib64", "/etc": "/etc"}
+_SYMLINKS = {("usr/bin", "/bin"), ("usr/sbin", "/sbin")}
+_SESSION_SUBDIRS = ("uploads", "output", "scratchpad")
+_SKILLS = "/sandbox_data/default_skills"
+_WORKSPACE = "/workspace"
+_ENV_NAMES = {"HOME", "PATH", "NODE_PATH", "TMPDIR", "TERM", "LANG"}
+_REQUIRED_FLAGS = {"--unshare-pid", "--die-with-parent", "--clearenv", "--new-session"}
+_ARITY = {
+    "--ro-bind": 2, "--bind": 2, "--symlink": 2, "--setenv": 2,
+    "--dev": 1, "--proc": 1, "--tmpfs": 1, "--dir": 1, "--chdir": 1, "--size": 1,
+    "--unshare-pid": 0, "--die-with-parent": 0, "--clearenv": 0, "--new-session": 0,
+}  # fmt: skip
+_PROGRAM = ["bash", "--noprofile", "--norc"]
+
+
+def spawn_argv_problem(argv: list[str]) -> str:
+    """不合规时返回原因,合规返回空串。只允许会话 shell 这一种形状。"""
+    if argv[-len(_PROGRAM) :] != _PROGRAM:
+        return "program"
+    i, end, flags, session = 1, len(argv) - len(_PROGRAM), set(), None
+    while i < end:
+        opt = argv[i]
+        if opt not in _ARITY or i + _ARITY[opt] >= end + (_ARITY[opt] == 0):
+            return f"option {opt[:32]}"
+        args = argv[i + 1 : i + 1 + _ARITY[opt]]
+        i += 1 + _ARITY[opt]
+        flags.add(opt)
+        if opt in ("--ro-bind", "--bind"):
+            src, dest = args
+            if opt == "--ro-bind" and (
+                _SYSTEM_RO.get(src) == dest or (src, dest) == (_SKILLS, _WORKSPACE + "/skills")
+            ):
+                continue
+            parts = src[len(SESSIONS_ROOT) :].split("/") if src.startswith(SESSIONS_ROOT) else []
+            if not (
+                len(parts) == 2
+                and SESSION_ID.fullmatch(parts[0])
+                and parts[1] in _SESSION_SUBDIRS
+                and session in (None, parts[0])
+                and dest == f"{_WORKSPACE}/{parts[1]}"
+                and (opt == "--ro-bind" or parts[1] != "uploads")
+            ):
+                return f"bind {src[:64]}"
+            session = parts[0]
+        elif opt == "--symlink" and tuple(args) not in _SYMLINKS:
+            return "symlink"
+        elif opt == "--setenv" and args[0] not in _ENV_NAMES:
+            return f"env {args[0][:32]}"
+        elif (
+            opt in ("--dev", "--proc", "--tmpfs")
+            and args[0] != {"--dev": "/dev", "--proc": "/proc", "--tmpfs": "/tmp"}[opt]
+        ):
+            return opt
+        elif opt == "--dir" and args[0] != _WORKSPACE:
+            return opt
+        elif opt == "--chdir" and not (
+            args[0] == _WORKSPACE or args[0].startswith(_WORKSPACE + "/")
+        ):
+            return opt
+        elif opt == "--size" and not args[0].isdigit():
+            return opt
+    if session is None or not _REQUIRED_FLAGS <= flags:
+        return "missing isolation flags or session binds"
+    return ""
 
 
 async def _docker_exec(user: str, script: str, timeout: int = EXEC_TIMEOUT_SEC):
@@ -178,15 +277,9 @@ async def provision(body: PathBody) -> dict[str, int]:
     started = time.monotonic()
     _check_container(body.container)
     path = _check_session_path(body.path)
-    p = shlex.quote(path)
-    # 只改顶层目录:后端与 agent 同为 UID 1000,目录里的文件属主本来就可读写;
-    # 递归改权限会随文件数变慢,还会给历史版本和快照加上可执行位
-    script = (
-        f"chmod 775 {p} {p}/uploads && "
-        f"chown {AGENT_USER}:{AGENT_USER} {p}/output {p}/scratchpad && "
-        f"chmod 777 {p}/output {p}/scratchpad && "
-        f"mkdir -p {p}/snapshots && chown {AGENT_USER}:{AGENT_USER} {p}/snapshots && chmod 700 {p}/snapshots"
-    )
+    # 以 root 运行:从 sessions 根逐段 O_NOFOLLOW 打开,再对描述符 fchown/fchmod。
+    # chown/chmod 按路径操作会跟随符号链接,子目录被换成指向 /etc 的链接时会改到容器系统文件
+    script = f"exec python3 -I -c {shlex.quote(PROVISION_PY)} {shlex.quote(session_of(path))}"
     code, _, err = await _docker_exec("root", script)
     if code != 0:
         audit("provision", "error", started, session=session_of(path), code=code)
@@ -225,32 +318,6 @@ async def exec_script(body: ExecBody) -> dict[str, object]:
         "stdout": out.decode(errors="replace"),
         "stderr": err.decode(errors="replace"),
     }
-
-
-@app.post("/file", dependencies=[Depends(require_token)])
-async def read_file(body: PathBody) -> Response:
-    started = time.monotonic()
-    _check_container(body.container)
-    raw_path = _check_session_path(body.path)
-    path = shlex.quote(raw_path)
-    # 符号链接可能指向别的会话或 default_skills:真实路径必须仍在同一会话目录内
-    session_dir = SESSIONS_ROOT + session_of(raw_path)
-    guard = f'R=$(realpath -e -- {path}) && case "$R" in {shlex.quote(session_dir)}/*) ;; *) exit 77;; esac'
-    # 一次 exec 内读取并限制长度:分成 stat + cat 两步时,文件可能在两步之间被换成更大的
-    code, data, _ = await _docker_exec(
-        AGENT_USER, f'{guard} && test -f "$R" && head -c {MAX_FILE_BYTES + 1} "$R"'
-    )
-    if code == 77:
-        audit("file", "escape_blocked", started, session=session_of(raw_path))
-        raise HTTPException(status_code=403, detail="Path resolves outside the session")
-    if code != 0:
-        audit("file", "not_found", started, session=session_of(raw_path))
-        raise HTTPException(status_code=404, detail="File not found")
-    if len(data) > MAX_FILE_BYTES:
-        audit("file", "too_large", started, session=session_of(raw_path))
-        raise HTTPException(status_code=413, detail="File too large")
-    audit("file", "ok", started, session=session_of(raw_path), bytes=len(data))
-    return Response(content=data, media_type="application/octet-stream")
 
 
 @app.websocket("/spawn")
@@ -292,8 +359,9 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
         and all(isinstance(a, str) for a in argv)
         and argv[0] == "bwrap"
     )
-    if not valid:
-        audit("spawn", "invalid_spec", started)
+    problem = spawn_argv_problem(argv) if valid else "spec"
+    if problem:
+        audit("spawn", "invalid_spec", started, problem=problem)
         await ws.close(code=4400)
         return
     needle = next((a for a in argv if a.startswith(SESSIONS_ROOT)), "")
@@ -305,25 +373,45 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
     spawn_id = secrets.token_hex(8)
     argv = ["bwrap", "--setenv", "DESKWORK_SPAWN_ID", spawn_id, *argv[1:]]
 
+    # bwrap 不能直接当 docker exec 的进程:它的父进程在容器外,并发启动时偶尔先退出,
+    # --die-with-parent 随即 SIGKILL 掉刚起的 shell(退出码 137)。垫一层 sh 当父进程,
+    # 不用 exec,保证 sh 一直活到 bwrap 结束。
     proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", "-i", "-u", AGENT_USER, CONTAINER, *argv,
+        "docker", "exec", "-i", "-u", AGENT_USER, CONTAINER,
+        "sh", "-c", SPAWN_WRAPPER, "sh", *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )  # fmt: skip
 
-    async def kill_in_container() -> None:
-        """杀掉容器内这次启动的 bwrap(--unshare-pid 保证其下所有进程一并消失)。
+    pattern = f"^bwrap --setenv DESKWORK_SPAWN_ID {spawn_id} "
 
-        `docker exec` 的客户端退出并不会终止容器里的进程,所以必须显式清理。
-        """
-        killer = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-u", AGENT_USER, CONTAINER,
-            "pkill", "-KILL", "-f", "--", f"^bwrap --setenv DESKWORK_SPAWN_ID {spawn_id} ",
+    async def in_container(*cmd: str) -> int:
+        child = await asyncio.create_subprocess_exec(
+            "docker", "exec", "-u", AGENT_USER, CONTAINER, *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )  # fmt: skip
-        await killer.wait()
+        return await child.wait()
+
+    async def kill_in_container() -> bool:
+        """杀掉容器内这次启动的 bwrap(--unshare-pid 保证其下所有进程一并消失),返回是否确认已停止。
+
+        `docker exec` 的客户端退出并不会终止容器里的进程,所以必须显式清理。pkill 返回 0(已杀)
+        或 1(没有匹配,早已退出)之外的码说明没执行成功;之后用 pgrep 确认进程确实不在了。
+        """
+        try:
+            if await in_container("pkill", "-KILL", "-f", "--", pattern) not in (0, 1):
+                return False
+            for _ in range(STOP_CONFIRM_POLLS):
+                if await in_container("pgrep", "-f", "--", pattern) == 1:
+                    return True
+                await asyncio.sleep(STOP_CONFIRM_INTERVAL)
+        except Exception:
+            audit_log.exception("kill_in_container failed")
+        return False
+
+    stop_state: dict[str, bool | None] = {"stopped": None}
 
     async def pump(stream: asyncio.StreamReader, channel: int) -> None:
         while chunk := await stream.read(65536):
@@ -344,7 +432,7 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
                     break  # docker exec 已退出;照常清理容器里可能残留的 bwrap
             elif message.get("text") == "terminate":
                 break
-        await kill_in_container()
+        stop_state["stopped"] = await kill_in_container()
         if proc.returncode is None:
             proc.terminate()
 
@@ -356,7 +444,11 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
     try:
         await proc.wait()
         await asyncio.gather(*readers, return_exceptions=True)
-        await ws.send_text(json.dumps({"exit": proc.returncode}))
+        # docker exec 客户端退出不等于容器内的 bwrap 已结束:没经 terminate 确认过就再确认一次
+        stopped = stop_state["stopped"]
+        if not stopped:
+            stopped = await kill_in_container()
+        await ws.send_text(json.dumps({"exit": proc.returncode, "stopped": stopped}))
         await ws.close()
     except Exception:
         pass
@@ -365,7 +457,14 @@ async def _run_spawn(ws: WebSocket, started: float) -> None:
         for task in readers:
             task.cancel()
         await asyncio.gather(reader_in, *readers, return_exceptions=True)
-        audit("spawn", "end", started, session=session, exit=proc.returncode)
+        audit(
+            "spawn",
+            "end",
+            started,
+            session=session,
+            exit=proc.returncode,
+            stopped=stop_state["stopped"],
+        )
         if proc.returncode is None:
             # 仅在进程仍在运行(异常断连)时清理;正常退出后命名空间已消失
             await kill_in_container()

@@ -4,10 +4,13 @@
 列出来,让用户看清磁盘上实际占了多少,但不改变配额口径。
 """
 
+import errno
 import os
 import shutil
+import stat
 from pathlib import Path
 
+from app.sandbox.host_files import parent_fd
 from app.sandbox.quota import dir_size
 from app.sandbox.session_paths import SessionPaths
 from app.services.file_versions import VERSIONS_DIR
@@ -61,21 +64,27 @@ def delete_session_file(paths: SessionPaths, relative_path: str) -> int:
     root = paths.session_root.resolve()
     parts = Path(relative_path).parts
     if len(parts) < 2 or parts[0] not in DELETABLE_DIRS or ".." in parts:
-        raise ValueError("Only files under uploads/ or output/ can be deleted")
-    top = root / parts[0]
-    # 中间目录可能被 agent 换成符号链接,所以对父目录做 resolve 再比对
-    parent = (root / Path(*parts[:-1])).resolve()
-    if parent != top.resolve() and not parent.is_relative_to(top.resolve()):
-        raise ValueError("Invalid path")
-    target = parent / parts[-1]
-    if target.is_symlink():
-        size = 0
-    elif target.is_file():
-        size = target.stat().st_size
-    else:
-        raise FileNotFoundError(relative_path)
-    target.unlink()
-    return size
+        raise ValueError("只能删除上传和产出目录里的文件")
+    # 沙箱里的后台进程可能随时把中间目录换成符号链接:逐级用 O_NOFOLLOW 打开目录,
+    # 再相对目录 fd 删除,检查和删除之间不会被换到会话外
+    try:
+        with parent_fd(root, root.joinpath(*parts)) as (fd, name):
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISLNK(st.st_mode):
+                size = 0
+            elif stat.S_ISREG(st.st_mode):
+                size = st.st_size
+            else:
+                raise FileNotFoundError(relative_path)
+            os.unlink(name, dir_fd=fd)
+            return size
+    except FileNotFoundError:
+        raise FileNotFoundError(relative_path) from None
+    except OSError as exc:
+        # 中间目录是符号链接(O_NOFOLLOW 报 ELOOP,加 O_DIRECTORY 时报 ENOTDIR)或是普通文件
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError("文件路径无效") from exc
+        raise
 
 
 def clear_history_versions(paths: SessionPaths) -> int:

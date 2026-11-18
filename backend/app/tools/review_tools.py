@@ -1,10 +1,13 @@
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import ToolMessage
+from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.context import RunContext, session_id_of
+from app.services.budget import BudgetExceeded
 from app.services.doc_review import render_pages, review_pages
-from app.utils import logger
+from app.services.tool_feedback import error_feedback
 
 REVIEW_DOCUMENT_DESCRIPTION = """Visually check a generated deliverable (docx / pptx / xlsx / pdf) for layout problems.
 
@@ -27,24 +30,25 @@ class ReviewDocumentInput(BaseModel):
         default="", description="One sentence describing what the user asked this file to be."
     )
     description: str = Field(..., description="How this tool call will be useful.")
-    runtime: ToolRuntime
+    runtime: ToolRuntime[RunContext]
 
 
 @tool(description=REVIEW_DOCUMENT_DESCRIPTION, args_schema=ReviewDocumentInput)
 async def review_document(
-    path: str, description: str, runtime: ToolRuntime, request: str = ""
+    path: str, description: str, runtime: ToolRuntime[RunContext], request: str = ""
 ) -> Command:
-    session_id = runtime.config.get("configurable", {})["thread_id"]
+    session_id = session_id_of(runtime)
     try:
         pages = await render_pages(session_id, path)
         verdict = await review_pages(pages, kind=path.rsplit(".", 1)[-1], request=request)
         status = "success"
         feedback = f"(checked {len(pages)} page(s))\n{verdict}"
+    except (BudgetExceeded, GraphBubbleUp):
+        raise
     except Exception as exc:
-        logger.error(f"review_document failed: {exc}")
         status = "error"
         feedback = (
-            f"Error: {exc}\nThe automatic layout check is unavailable; "
+            f"{error_feedback('review_document', exc)}\nThe automatic layout check is unavailable; "
             "continue without it and mention that the layout was not verified."
         )
     return Command(

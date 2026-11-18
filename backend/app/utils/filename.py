@@ -1,25 +1,38 @@
 import re
+import unicodedata
 from pathlib import Path
+
+MAX_NAME_BYTES = 200
+MAX_SUFFIX_CHARS = 16
+# 这些字符在 shell 和 Windows 文件名里有特殊含义;模型拼命令时容易漏引号,统一换掉
+_UNSAFE_CHARS = re.compile(r"[\s()<>:\"|?*$`;&!'\[\]{}#~^%]+")
+
+
+def _visible(text: str) -> str:
+    """NFC 归一化并去掉控制字符和格式字符(含 NUL、ANSI 转义、RLO 等双向覆盖符)。"""
+    text = unicodedata.normalize("NFC", text)
+    return "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf"))
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    return text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def normalize_upload_filename(raw: str) -> str:
-    """Return a shell-safe basename for uploaded files."""
-    name = Path(raw).name
-    stem = Path(name).stem
-    suffix = Path(name).suffix
+    """把上传文件名变成安全的单层文件名:只取最后一段,去掉不可见字符和 shell 特殊字符,
+    不以点或连字符开头(避免隐藏文件和被当成命令选项),UTF-8 不超过 MAX_NAME_BYTES 字节。
+    结果仍需在命令里加引号使用,这里只是降低出错概率。"""
+    name = _visible(raw).replace("\\", "/").rsplit("/", 1)[-1]
+    stem, dot, suffix = name.rpartition(".")
+    if not dot or not stem.strip("._- "):
+        stem, suffix = name, ""
+    suffix = _UNSAFE_CHARS.sub("", suffix)[:MAX_SUFFIX_CHARS]
+    suffix = f".{suffix}" if suffix else ""
 
-    normalized_stem = re.sub(r"[\s()]+", "_", stem)
-    normalized_stem = re.sub(r"_+", "_", normalized_stem).strip("_")
-
-    if not normalized_stem:
-        normalized_stem = "upload"
-
-    normalized = f"{normalized_stem}{suffix}"
-
-    if ".." in Path(normalized).parts or "/" in normalized or "\\" in normalized:
-        return f"upload{suffix}"
-
-    return normalized
+    stem = _UNSAFE_CHARS.sub("_", stem)
+    stem = re.sub(r"_+", "_", stem).strip("_").lstrip(".-")
+    stem = _truncate_utf8(stem, MAX_NAME_BYTES - len(suffix.encode("utf-8"))).rstrip("_.")
+    return f"{stem or 'upload'}{suffix}"
 
 
 def unique_upload_name(

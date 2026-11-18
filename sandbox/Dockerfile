@@ -1,5 +1,12 @@
 FROM python:3.12-slim
 
+# APT_MIRROR 留空用 Debian 官方源;官方源慢时在 .env 里改成国内镜像(如 https://mirrors.tuna.tsinghua.edu.cn)。
+# 只替换主机部分,debian 与 debian-security 两个仓库都会改
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org|${APT_MIRROR%/}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi
+
 ARG USER=agent
 ARG UID=1000
 
@@ -67,6 +74,16 @@ RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
     # skills 引用的提取/OCR 工具
     "markitdown[pptx,docx,xlsx,pdf]==0.1.9" pytesseract==0.3.13 pdf2image==1.17.0
 
+# 中文 OCR 语言包。单独成层放在最后:改动它不会让上面的 npm/pip 层缓存失效。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr-chi-sim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Windows 中文字体 -> Noto CJK 的别名,让预览图接近用户机器上的效果(见文件内注释)
+COPY fonts-local.conf /etc/fonts/local.conf
+# 按会话限内存的看门狗,作为容器主进程常驻(说明见文件头)
+COPY memwatch.py /opt/memwatch.py
+
 RUN groupadd --gid ${UID} ${USER} \
     && useradd --create-home --uid ${UID} --gid ${UID} --shell /bin/bash ${USER}
 
@@ -78,4 +95,4 @@ WORKDIR /sandbox_data
 
 USER ${USER}
 
-CMD ["sleep", "infinity"]
+CMD ["python3", "-I", "/opt/memwatch.py"]

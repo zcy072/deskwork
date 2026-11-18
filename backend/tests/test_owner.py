@@ -61,9 +61,9 @@ async def test_session_endpoints_hide_other_owners(client, monkeypatch):
 
     async def status(sid):
         called.append(sid)
-        return "complete"
+        return "complete", None
 
-    monkeypatch.setattr(stream, "get_thread_status", status)
+    monkeypatch.setattr(stream, "get_run_status", status)
     assert (await client.get("/thread-status/s1", headers=HB)).status_code == 404
     assert (await client.post("/thread-cancel/s1", headers=HB)).status_code == 404
     assert (

@@ -1,17 +1,20 @@
 import asyncio
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from app.agents.checkpointers import get_checkpointer
+from app.api.file_response import WorkspaceFileResponse
 from app.api.security import get_owner, rate_limit_default, rate_limit_send, require_api_key
 from app.config import settings
-from app.db import is_db_ready, repository
+from app.db import repository
+from app.db import runs as run_store
+from app.runtime.sessions import file_io, sessions
 from app.sandbox.quota import QuotaExceededError
 from app.sandbox.session_paths import SessionPaths
 from app.schemas import SESSION_ID_PATTERN, StreamEventsRequest
@@ -19,17 +22,19 @@ from app.services import session_export
 from app.services.chat_operations import (
     ActiveRunError,
     RewindError,
+    StreamExpiredError,
     TooManyRunsError,
     cancel_chat,
-    get_active_prompt_id,
+    drain_session_work,
+    get_run_status,
     start_chat,
     stream_chat_events,
 )
-from app.services.checkpoint_transfer import CheckpointRejected, export_thread
 from app.services.document_sources import read_source
 from app.services.file_operations import InMemoryUpload
 from app.services.file_preview import PreviewError, office_to_pdf
 from app.services.file_versions import find_delivered, list_versions, read_version
+from app.services.rewind import FilesUnavailable
 from app.services.storage import (
     clear_history_versions,
     clear_scratchpad,
@@ -37,7 +42,7 @@ from app.services.storage import (
     list_session_files,
     storage_breakdown,
 )
-from app.utils import get_thread_status, get_trace_id, logger
+from app.utils import get_trace_id, logger
 
 stream_router = APIRouter(
     tags=["stream"], dependencies=[Depends(require_api_key), Depends(rate_limit_default)]
@@ -82,12 +87,19 @@ async def _require_visible(request: Request, session_id: str, *, allow_new: bool
 
     只有 send-message 允许 allow_new:新会话由第一次发送创建。
     """
-    if not is_db_ready():
-        return
     if not await repository.conversation_visible(
         session_id, get_owner(request), allow_missing=allow_new
     ):
-        raise HTTPException(status_code=404, detail="Conversation not found")
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+
+@contextmanager
+def _file_operation(session_id: str):
+    try:
+        with sessions.operation(session_id, "files"):
+            yield
+    except ActiveRunError as exc:
+        raise HTTPException(409, "会话正在执行操作,请等待结束后再试") from exc
 
 
 @stream_router.post("/send-message", dependencies=[Depends(rate_limit_send)])
@@ -98,6 +110,9 @@ async def send_message_endpoint(
     files: list[UploadFile] = File(default=[]),
     rewind_to_message_id: int | None = Form(None, ge=1),
     client_request_id: str | None = Form(None, max_length=64),
+    rewind_mode: Literal["full", "conversation_only"] = Form("full"),
+    interrupt_id: str | None = Form(None, max_length=128),
+    mode: Literal["auto", "new", "resume"] = Form("auto"),
 ):
     """Accept a message request, upload files, return prompt_id.
 
@@ -114,11 +129,16 @@ async def send_message_endpoint(
             rewind_to_message_id=rewind_to_message_id,
             owner=get_owner(request),
             client_request_id=client_request_id,
+            rewind_mode=rewind_mode,
+            interrupt_id=interrupt_id,
+            mode=mode,
         )
+    except FilesUnavailable as exc:
+        raise HTTPException(409, {"code": "files_unavailable", "message": str(exc)}) from exc
     except QuotaExceededError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     except repository.NotOwnerError as exc:
-        raise HTTPException(status_code=404, detail="Conversation not found") from exc
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
     except (ValueError, RewindError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except TooManyRunsError as exc:
@@ -128,7 +148,7 @@ async def send_message_endpoint(
     except Exception as exc:
         logger.exception("Failed to start chat for session '%s'", session_id)
         raise HTTPException(
-            status_code=500, detail=f"Failed to start generation (trace id: {get_trace_id()})"
+            status_code=500, detail=f"启动生成失败,请稍后重试(trace id: {get_trace_id()})"
         ) from exc
 
     return JSONResponse(content={"prompt_id": prompt_id})
@@ -147,6 +167,8 @@ async def stream_events_endpoint(http_request: Request, request: StreamEventsReq
 
     try:
         first_line = await events.__anext__()
+    except StreamExpiredError as exc:
+        raise HTTPException(410, str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except StopAsyncIteration:
@@ -168,13 +190,30 @@ async def stream_events_endpoint(http_request: Request, request: StreamEventsReq
 @stream_router.get("/thread-status/{session_id}")
 async def thread_status(request: Request, session_id: SessionIdPath):
     await _require_visible(request, session_id)
-    status = await get_thread_status(session_id)
+    status, prompt_id = await get_run_status(session_id)
     if status is None:
-        raise HTTPException(status_code=404, detail="Generation not found")
-    prompt_id = get_active_prompt_id(session_id) if status == "running" else None
+        raise HTTPException(status_code=404, detail="没有找到这个会话的生成记录")
     return JSONResponse(
         content={"session_id": session_id, "status": status, "prompt_id": prompt_id}
     )
+
+
+@stream_router.get("/runs/{run_id}")
+async def get_run(request: Request, run_id: Annotated[str, PathParam(pattern=SESSION_ID_PATTERN)]):
+    run = await run_store.get(run_id, get_owner(request))
+    if run is None:
+        raise HTTPException(404, "没有找到这次生成记录")
+    message = await run_store.message(run_id)
+    return {
+        "id": run.id,
+        "session_id": run.conversation_id,
+        "status": run.status,
+        "error_code": run.error_code,
+        "message": run.public_error,
+        "parts": repository.normalize_delivered_parts(message.parts) if message else [],
+        "last_event_seq": message.last_event_seq if message else 0,
+        "input": {"text": run.input_json.get("text", ""), "files": run.input_json.get("files", [])},
+    }
 
 
 @stream_router.post("/thread-cancel/{session_id}")
@@ -218,10 +257,10 @@ async def download_file(
     # 白名单要对解析后的路径判断,否则 output/../scratchpad/x 能绕过前缀检查
     session_root = paths.session_root.resolve()
     if not any(file_path.is_relative_to(session_root / d) for d in ("uploads", "output")):
-        raise HTTPException(status_code=400, detail="Invalid path")
+        raise HTTPException(status_code=400, detail="只能访问上传和产出目录里的文件")
 
     if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="文件不存在")
 
     if fingerprint is not None:
         # 校验和响应使用同一份字节,避免校验后文件被改写造成引用错位。
@@ -230,7 +269,7 @@ async def download_file(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except OSError as exc:
-            raise HTTPException(status_code=404, detail="File not found") from exc
+            raise HTTPException(status_code=404, detail="文件不存在") from exc
         if hashlib.sha256(data).hexdigest() != fingerprint:
             raise HTTPException(
                 status_code=409, detail="原文件已变化,无法定位这条旧引用。请重新检索文件。"
@@ -245,14 +284,7 @@ async def download_file(
         )
 
     # html/svg 会被浏览器当页面执行,下载接口只该当附件:禁止嗅探并套上 sandbox CSP
-    return FileResponse(
-        path=file_path,
-        filename=Path(relative_path).name,
-        headers={
-            "X-Content-Type-Options": "nosniff",
-            "Content-Security-Policy": "sandbox",
-        },
-    )
+    return WorkspaceFileResponse(paths, file_path, filename=Path(relative_path).name)
 
 
 @stream_router.get("/files/storage")
@@ -289,17 +321,17 @@ async def delete_file(
 ):
     """删除 uploads/ 或 output/ 下的单个文件。生成中不允许,避免 agent 正在使用的文件被抽走。"""
     await _require_visible(request, session_id)
-    if get_active_prompt_id(session_id) is not None:
-        raise HTTPException(status_code=409, detail="会话正在生成,请等待结束后再删除文件")
-    try:
-        freed = await asyncio.to_thread(
-            delete_session_file, SessionPaths.create(session_id), relative_path
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="File not found") from exc
-    return {"freed": freed}
+    with _file_operation(session_id):
+        await drain_session_work(session_id)
+        try:
+            freed = await file_io(
+                delete_session_file, SessionPaths.create(session_id), relative_path
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="文件不存在") from exc
+        return {"freed": freed}
 
 
 @stream_router.delete("/files/versions")
@@ -309,10 +341,10 @@ async def clear_versions(
 ):
     """清空所有文件的历史版本(保留各文件最近一次交付的副本)。生成中不允许。"""
     await _require_visible(request, session_id)
-    if get_active_prompt_id(session_id) is not None:
-        raise HTTPException(status_code=409, detail="会话正在生成,请等待结束后再清理")
-    freed = await asyncio.to_thread(clear_history_versions, SessionPaths.create(session_id))
-    return {"freed": freed}
+    with _file_operation(session_id):
+        await drain_session_work(session_id)
+        freed = await file_io(clear_history_versions, SessionPaths.create(session_id))
+        return {"freed": freed}
 
 
 @stream_router.delete("/files/scratchpad")
@@ -322,10 +354,10 @@ async def clear_scratch(
 ):
     """清空暂存目录(agent 的中间文件)。生成中不允许,避免抽走正在使用的文件。"""
     await _require_visible(request, session_id)
-    if get_active_prompt_id(session_id) is not None:
-        raise HTTPException(status_code=409, detail="会话正在生成,请等待结束后再清理")
-    freed = await asyncio.to_thread(clear_scratchpad, SessionPaths.create(session_id))
-    return {"freed": freed}
+    with _file_operation(session_id):
+        await drain_session_work(session_id)
+        freed = await file_io(clear_scratchpad, SessionPaths.create(session_id))
+        return {"freed": freed}
 
 
 @stream_router.get("/files/export")
@@ -333,47 +365,39 @@ async def export_session(
     request: Request,
     session_id: Annotated[str, Query(pattern=SESSION_ID_PATTERN)],
 ):
-    """会话备份包(zip):消息、附件元数据,以及 uploads/ output/ 下的文件和 sha256 清单。"""
+    """会话备份包(zip):消息、附件元数据,以及 uploads/ output/ 下的文件和 sha256 清单;不含 checkpoint。"""
     await _require_visible(request, session_id)
-    if get_active_prompt_id(session_id) is not None:
-        raise HTTPException(status_code=409, detail="会话正在生成,请等待结束后再导出")
-    owner = get_owner(request)
-    conv = await repository.get_conversation(session_id, owner)
-    messages = await repository.get_messages(session_id, owner=owner)
-    if conv is None or messages is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    attachments = await repository.get_files_for_messages([m.id for m in messages])
-    document = session_export.conversation_document(conv, messages, attachments)
-    for m in document["messages"]:
-        m["parts"] = repository.normalize_delivered_parts(m["parts"])
+    with _file_operation(session_id):
+        await drain_session_work(session_id)
+        owner = get_owner(request)
+        conv = await repository.get_conversation(session_id, owner)
+        messages = await repository.get_messages(session_id, owner=owner)
+        if conv is None or messages is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        attachments = await repository.get_files_for_messages([m.id for m in messages])
+        run_records = await run_store.for_messages([m.prompt_id for m in messages], session_id)
+        document = session_export.conversation_document(conv, messages, attachments, run_records)
+        for m in document["messages"]:
+            m["parts"] = repository.normalize_delivered_parts(m["parts"])
 
-    checkpoint, checkpoint_note = None, None
-    try:
-        checkpoint = await export_thread(get_checkpointer(), session_id)
-        if checkpoint is None:
-            checkpoint_note = "当前服务没有持久化 checkpoint"
-    except CheckpointRejected as exc:
-        checkpoint_note = str(exc)
-    dest = session_export.new_archive_path()
-    try:
-        await asyncio.to_thread(
-            session_export.build_session_archive,
-            SessionPaths.create(session_id),
-            document,
-            dest,
-            checkpoint,
-            checkpoint_note,
+        dest = session_export.new_archive_path()
+        try:
+            await file_io(
+                session_export.build_session_archive,
+                SessionPaths.create(session_id),
+                document,
+                dest,
+            )
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
+        return FileResponse(
+            path=dest,
+            filename=f"deskwork-{session_id}.zip",
+            media_type="application/zip",
+            background=BackgroundTask(dest.unlink, missing_ok=True),
+            headers={"X-Content-Type-Options": "nosniff"},
         )
-    except BaseException:
-        dest.unlink(missing_ok=True)
-        raise
-    return FileResponse(
-        path=dest,
-        filename=f"deskwork-{session_id}.zip",
-        media_type="application/zip",
-        background=BackgroundTask(dest.unlink, missing_ok=True),
-        headers={"X-Content-Type-Options": "nosniff"},
-    )
 
 
 @stream_router.get("/files/preview")
@@ -387,7 +411,7 @@ async def preview_file(
     try:
         pdf = await office_to_pdf(session_id, relative_path)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="File not found") from exc
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PreviewError as exc:
@@ -456,7 +480,7 @@ async def download_file_version(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OSError as exc:
-        raise HTTPException(status_code=404, detail="Version not found") from exc
+        raise HTTPException(status_code=404, detail="这个历史版本不存在") from exc
     return Response(
         content=data,
         media_type="application/octet-stream",

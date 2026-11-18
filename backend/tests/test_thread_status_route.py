@@ -10,7 +10,7 @@ from app.config import settings
 
 
 @pytest.fixture
-async def client(monkeypatch):
+async def client(visible_sessions, monkeypatch):
     monkeypatch.setattr(settings, "API_KEYS", "")
 
     async def one(key, ttl):
@@ -23,10 +23,9 @@ async def client(monkeypatch):
 
 def _status(monkeypatch, value, prompt_id=None):
     async def get_status(session_id):
-        return value
+        return value, prompt_id if value == "running" else None
 
-    monkeypatch.setattr(stream, "get_thread_status", get_status)
-    monkeypatch.setattr(stream, "get_active_prompt_id", lambda session_id: prompt_id)
+    monkeypatch.setattr(stream, "get_run_status", get_status)
 
 
 async def test_running_returns_prompt_id(client, monkeypatch):
@@ -45,3 +44,5 @@ async def test_finished_has_no_prompt_id(client, monkeypatch):
 async def test_unknown_session_404(client, monkeypatch):
     _status(monkeypatch, None)
     assert (await client.get("/thread-status/s1")).status_code == 404
+    # 不存在或别人的会话一律 404,不再在没有数据库时放行
+    assert (await client.get("/thread-status/nope")).status_code == 404

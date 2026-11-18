@@ -85,7 +85,7 @@ class FakeClient:
         self.spawned: list[FakeProcess] = []
         self.terminated: list[FakeProcess] = []
 
-    async def spawn(self, container, argv, user=None):
+    async def spawn(self, container, argv):
         proc = FakeProcess()
         self.spawned.append(proc)
         return proc
@@ -113,7 +113,7 @@ def _data_root(tmp_path, monkeypatch):
 def _session(tmp_path, client) -> BashSession:
     paths = SessionPaths.create("cancel-test", sessions_root=tmp_path)
     paths.scratchpad.mkdir(parents=True)
-    return BashSession(paths, docker_client=client)
+    return BashSession(paths, manager_client=client)
 
 
 async def test_normal_command_returns_output(tmp_path):
@@ -158,6 +158,9 @@ async def test_timeout_returns_error(tmp_path):
     session = _session(tmp_path, client)
     out, err = await session.execute("sleep 999", timeout=1)
     assert err and "timed out" in out
+    # 超时会重启 shell:必须告诉模型 cwd 和变量已重置,否则它会在错误的目录里继续操作
+    assert "restarted" in out and "reset" in out
+    assert len(client.spawned) == 2
     await session._stop()
 
 

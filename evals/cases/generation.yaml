@@ -13,6 +13,7 @@
     - no_error: true
     - file_exists: "*.pptx"
     - file_contains: {glob: "*.pptx", any: ["向量", "vector"]}
+    - pptx_slides: {glob: "*.pptx", min: 4, max: 7}
   rubric: 页数大致 4-7 页,内容涵盖定义、应用、与传统数据库区别三点,没有明显事实错误。
 - id: gen-xlsx-budget
   category: 文档生成

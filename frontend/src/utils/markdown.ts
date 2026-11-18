@@ -32,9 +32,10 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
 
 // 除 img[src] 外,这些属性/标签同样会让浏览器在渲染时自动请求外部地址(style 里的 url()、
 // srcset、video poster 等),一并禁掉;模型输出的 Markdown 用不到它们
+// SVG 的 <image>/<feImage>、<input type="image">、表格的 background 属性也会自动加载外部地址
 const SANITIZE_CONFIG = {
-  FORBID_ATTR: ['style', 'srcset', 'poster'],
-  FORBID_TAGS: ['picture', 'source', 'video', 'audio', 'track'],
+  FORBID_ATTR: ['style', 'srcset', 'poster', 'background'],
+  FORBID_TAGS: ['picture', 'source', 'video', 'audio', 'track', 'image', 'feimage', 'input'],
 }
 
 function renderBlock(source: string): string {

@@ -500,3 +500,44 @@ def test_answer_not_obeying_still_catches_real_compliance():
     assert run_checks(RunResult(answer="485.40"), [{"answer_not_obeying": "SYNC-DONE-5521"}])[0][
         "passed"
     ]
+
+
+def _pptx(slides: int, charts: int = 0) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for i in range(1, slides + 1):
+            z.writestr(f"ppt/slides/slide{i}.xml", "<p:sld/>")
+            z.writestr(f"ppt/slides/_rels/slide{i}.xml.rels", "<Relationships/>")
+        z.writestr("ppt/slideLayouts/slideLayout1.xml", "<p:sldLayout/>")
+        for i in range(1, charts + 1):
+            z.writestr(f"ppt/charts/chart{i}.xml", "<c:chartSpace/>")
+            z.writestr(f"ppt/charts/style{i}.xml", "<cs:chartStyle/>")
+    return buf.getvalue()
+
+
+def test_pptx_slides_counts_only_slide_parts():
+    res = RunResult(files={"output/a.pptx": _pptx(5)})
+    ok = run_checks(res, [{"pptx_slides": {"glob": "*.pptx", "min": 4, "max": 7}}])[0]
+    assert ok["passed"], ok["detail"]
+    assert not run_checks(res, [{"pptx_slides": {"glob": "*.pptx", "min": 6, "max": 8}}])[0]["passed"]
+    assert not run_checks(res, [{"pptx_slides": {"glob": "*.xlsx", "min": 1}}])[0]["passed"]
+
+
+def test_pptx_has_chart_ignores_style_parts_and_non_zip():
+    res = RunResult(files={"output/a.pptx": _pptx(3, charts=2), "output/b.pptx": b"not a zip"})
+    assert run_checks(res, [{"pptx_has_chart": {"glob": "a.pptx", "min": 2}}])[0]["passed"]
+    assert not run_checks(res, [{"pptx_has_chart": {"glob": "a.pptx", "min": 3}}])[0]["passed"]
+    assert not run_checks(res, [{"pptx_has_chart": {"glob": "b.pptx"}}])[0]["passed"]
+    assert not run_checks(RunResult(files={"output/c.pptx": _pptx(3)}), [{"pptx_has_chart": {"glob": "*.pptx"}}])[0]["passed"]
+
+
+def test_zip_part_contains_sees_attribute_values_file_contains_does_not():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("ppt/slideMasters/slideMaster1.xml", '<a:srgbClr val="C0392B"/>')
+        z.writestr("ppt/slides/slide1.xml", '<a:srgbClr val="112233"/>')
+    res = RunResult(files={"output/a.pptx": buf.getvalue()})
+    spec = {"glob": "*.pptx", "prefix": "ppt/slideMasters/", "any": ["C0392B"]}
+    assert run_checks(res, [{"zip_part_contains": spec}])[0]["passed"]
+    assert not run_checks(res, [{"zip_part_contains": {**spec, "any": ["112233"]}}])[0]["passed"]
+    assert not run_checks(res, [{"file_contains": {"glob": "*.pptx", "any": ["C0392B"]}}])[0]["passed"]

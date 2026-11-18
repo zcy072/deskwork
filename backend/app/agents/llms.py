@@ -115,6 +115,10 @@ def build_model(profile: LLMProfile | None = None) -> BaseChatModel:
             base_url=base_url,
             model=profile.model,
             temperature=settings.LLM_TEMPERATURE,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
+            # langchain-openai 只在没设 base_url 时才默认在流式响应里要用量;DeepSeek/中转站都设了
+            # base_url,不显式打开的话流式消息不带 usage_metadata,预算的 token 上限和用量统计都会落空
+            stream_usage=True,
         )
 
     if provider == "anthropic":
@@ -130,6 +134,7 @@ def build_model(profile: LLMProfile | None = None) -> BaseChatModel:
             base_url=base_url,
             model=profile.model,
             max_tokens=settings.LLM_MAX_TOKENS,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
             **kwargs,
         )
 
@@ -142,6 +147,7 @@ def build_model(profile: LLMProfile | None = None) -> BaseChatModel:
             api_version=settings.LLM_API_VERSION,
             model=profile.model,
             temperature=settings.LLM_TEMPERATURE,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     raise ValueError(

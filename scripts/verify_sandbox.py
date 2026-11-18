@@ -1,4 +1,4 @@
-"""真实沙箱生命周期验收,只操作随机 accept-* 会话并在 finally 清理。
+"""真实沙箱生命周期验收(含只读执行隔离),只操作随机 accept-* 会话并在 finally 清理。
 
 运行: docker compose exec -T -e LOG_LEVEL=WARNING backend python - < scripts/verify_sandbox.py
 仅修改本测试进程中的设置,不改变服务配置。需已启动 Compose。
@@ -10,6 +10,7 @@ import uuid
 
 from app.config import settings
 from app.sandbox.bash_handler import BashSessionsManager
+from app.sandbox.errors import SandboxStopUnconfirmed
 
 
 async def main():
@@ -46,6 +47,20 @@ async def main():
         out, err = await s.execute("cat /workspace/output/check.txt")
         assert not err and "0" in out
         results["restart_preserves_files"] = True
+        # 只读执行:改不了 output/,有私有 /tmp,且不影响父 shell
+        out, err = await s.execute("printf original > /workspace/output/guard.txt")
+        assert not err, out
+        await s.execute_readonly(
+            "python3 -c \"open('/workspace/output/guard.txt', 'w').write('changed')\"", 10
+        )
+        assert (s.paths.output / "guard.txt").read_text() == "original"
+        out, err = await s.execute_readonly(
+            "python3 -c \"open('/tmp/allowed.txt', 'w').write('ok'); print('tmp-ok')\"", 10
+        )
+        assert not err and "tmp-ok" in out, out
+        out, err = await s.execute("printf alive")
+        assert not err and "alive" in out, out
+        results["readonly_isolation"] = True
         task = asyncio.create_task(s.execute("sleep 30", timeout=40))
         await asyncio.sleep(1)
         s.last_used -= 10
@@ -57,12 +72,19 @@ async def main():
         results["busy_not_reaped_cancel_closes"] = True
         out, err = await s.execute("echo recovered")
         assert not err and "recovered" in out
+        # 连接断开而没有结束回执:无法确认进程已停,会话应被挡住而不是悄悄重连(R12)
         await s._process._ws.close()
         await asyncio.sleep(1)
         assert not s.shell_alive
-        out, err = await s.execute("echo reconnected")
-        assert not err and "reconnected" in out
-        results["disconnect_reconnect"] = True
+        try:
+            await s.execute("echo reconnected")
+        except SandboxStopUnconfirmed:
+            pass
+        else:
+            raise AssertionError("disconnect without receipt must block the session")
+        assert s.stop_state.unconfirmed
+        results["disconnect_blocks_session"] = True
+        s = await mgr.get_or_create(ids[1])
         out, err = await s.execute("sleep 5", timeout=1)
         assert err and "timed out" in out
         out, err = await s.execute("echo after_timeout")
@@ -79,11 +101,11 @@ async def main():
         await mgr.close_all()
         for sid in ids:
             await mgr.purge_session(sid)
-        remaining = await mgr._docker_client.run_exec(mgr.container_name, "ps -eo stat,args")
+        remaining = await mgr._manager_client.run_exec(mgr.container_name, "ps -eo stat,args")
         assert remaining.returncode == 0
         assert not any(prefix in line and "bwrap" in line for line in remaining.stdout.splitlines())
         results["test_processes_remaining"] = 0
-        await mgr._docker_client.http.aclose()
+        await mgr._manager_client.http.aclose()
     print("STABILITY_RESULT", json.dumps(results), flush=True)
 
 

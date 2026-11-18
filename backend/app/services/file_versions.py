@@ -6,11 +6,10 @@
 """
 
 import hashlib
-import shutil
-import tempfile
-from contextlib import suppress
+import os
 from pathlib import Path
 
+from app.sandbox.host_files import copy_regular_atomic, open_regular
 from app.sandbox.session_paths import SessionPaths
 
 KEEP = 5
@@ -36,65 +35,64 @@ def archive_previous(paths: SessionPaths, dest: Path) -> Path | None:
             return None
         target_dir = _dir(paths, dest.name)
         target_dir.mkdir(parents=True, exist_ok=True)
-        return _archive_copy(dest, target_dir)
+        return _archive_copy(paths.session_root, dest, target_dir)
     except OSError:
         return None
 
 
-def finish_archive(paths: SessionPaths, dest: Path, archived: Path | None) -> None:
+def finish_archive(paths: SessionPaths, dest: Path, archived: Path | None) -> bool:
     """只在交付成功后调用:归档旧内容,原子更新交付副本,裁剪历史。"""
     try:
         if dest.is_symlink() or not dest.is_file():
-            return
+            return False
         directory = _dir(paths, dest.name)
-        if archived is not None and _same_content(archived, dest):
+        root = paths.session_root
+        if archived is not None and _same_content(root, archived, dest):
             if archived.name != CURRENT:
                 archived.unlink(missing_ok=True)
         elif archived is not None and archived.name == CURRENT:
-            _archive_copy(archived, directory)
+            _archive_copy(root, archived, directory)
         directory.mkdir(parents=True, exist_ok=True)
         if dest.stat().st_size <= MAX_BYTES:
             # 不能直接覆盖 .current:复制失败时仍要保留上次成功交付。
-            _atomic_copy(dest, directory / CURRENT)
+            copy_file_atomic(dest, directory / CURRENT, root)
         else:
             (directory / CURRENT).unlink(missing_ok=True)
         _prune(directory)
+        return (directory / CURRENT).is_file()
     except OSError:
-        pass
-
-
-def _atomic_copy(source: Path, target: Path) -> None:
-    with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".delivery-", delete=False) as f:
-        temporary = Path(f.name)
-    try:
-        shutil.copy2(source, temporary)
-        temporary.replace(target)
-    finally:
-        with suppress(OSError):
-            temporary.unlink(missing_ok=True)
-
-
-def _same_content(left: Path, right: Path) -> bool:
-    # 不使用基于 mtime/size 缓存比较结果的 filecmp:Agent 可能保持相同的文件时间。
-    if left.stat().st_size != right.stat().st_size:
         return False
-    with left.open("rb") as a, right.open("rb") as b:
+
+
+def copy_file_atomic(
+    source: Path, target: Path, root: Path, source_root: Path | None = None
+) -> None:
+    """source 与 target 都必须位于可信根下;output 对 agent 可写,不能按路径名重新打开。"""
+    copy_regular_atomic(source, target, source_root or root, root)
+
+
+def _same_content(root: Path, left: Path, right: Path) -> bool:
+    # 不使用基于 mtime/size 缓存比较结果的 filecmp:Agent 可能保持相同的文件时间。
+    with open_regular(root, left) as a, open_regular(root, right) as b:
+        if os.fstat(a.fileno()).st_size != os.fstat(b.fileno()).st_size:
+            return False
         while data := a.read(64 * 1024):
             if data != b.read(len(data)):
                 return False
         return not b.read(1)
 
 
-def _archive_copy(source: Path, directory: Path) -> Path:
+def _archive_copy(root: Path, source: Path, directory: Path) -> Path:
     """mtime 相同但内容不同时分配相邻版本号,避免覆盖旧内容。"""
-    version = source.stat().st_mtime_ns
+    with open_regular(root, source) as fh:
+        version = os.fstat(fh.fileno()).st_mtime_ns
     target = directory / str(version)
     while target.exists():
-        if _same_content(source, target):
+        if _same_content(root, source, target):
             return target
         version += 1
         target = directory / str(version)
-    _atomic_copy(source, target)
+    copy_file_atomic(source, target, root)
     return target
 
 
@@ -112,7 +110,7 @@ def _prune(directory: Path) -> None:
 def list_versions(paths: SessionPaths, file_name: str) -> list[dict]:
     """历史版本,新的在前。version 是旧文件的 mtime_ns(字符串),modified_at 为 epoch 秒。"""
     if "/" in file_name or file_name in ("", ".", ".."):
-        raise ValueError("Invalid file name")
+        raise ValueError("文件名无效")
     directory = _dir(paths, file_name)
     if not directory.is_dir():
         return []
@@ -132,15 +130,15 @@ def list_versions(paths: SessionPaths, file_name: str) -> list[dict]:
 def read_version(paths: SessionPaths, file_name: str, version: str) -> bytes:
     """抛 ValueError(参数不合法)、FileNotFoundError。"""
     if "/" in file_name or file_name in ("", ".", "..") or not version.isdigit():
-        raise ValueError("Invalid version")
+        raise ValueError("版本号无效")
     return paths.read_host_file(_dir(paths, file_name) / version, MAX_BYTES)
 
 
-def digest_file(path: Path) -> tuple[str, int]:
+def digest_file(root: Path, path: Path) -> tuple[str, int]:
     """(sha256 十六进制, 字节数)。交付时记入记录,之后据此找回当时的版本。"""
     h = hashlib.sha256()
     size = 0
-    with path.open("rb") as f:
+    with open_regular(root, path) as f:
         while chunk := f.read(1024 * 1024):
             h.update(chunk)
             size += len(chunk)
@@ -153,7 +151,7 @@ def find_delivered(
     """按内容摘要找回某次交付的版本:依次看 output 里的文件、上次交付副本和历史版本。
     找不到(被裁剪、超过大小上限)返回 None。size 仅用来跳过明显不符的候选。"""
     if "/" in file_name or file_name in ("", ".", ".."):
-        raise ValueError("Invalid file name")
+        raise ValueError("文件名无效")
     directory = _dir(paths, file_name)
     candidates = [paths.output / file_name, directory / CURRENT]
     if directory.is_dir():

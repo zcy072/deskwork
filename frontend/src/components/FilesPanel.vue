@@ -140,7 +140,8 @@ function confirmClear(kind: keyof typeof CLEAR_KINDS) {
 <style scoped>
 .files { width: 268px; padding: 18px 12px; border-left: 1px solid var(--line); background: var(--panel-bg); box-sizing: border-box; overflow-y: auto; }
 .head { font-weight: 650; margin: 14px 0 12px; font-size: 14px; }
-.file { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 6px; background: var(--card-bg); border: 1px solid var(--line); border-radius: 10px; }
-.btns { display: flex; gap: 4px; flex-shrink: 0; }
-.name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; margin-bottom: 6px; background: var(--card-bg); border: 1px solid var(--line); border-radius: 10px; }
+/* 侧栏只有 268px,文件名单独占一行,按钮放下面,免得文件名被挤成几个字 */
+.btns { display: flex; gap: 4px; justify-content: flex-end; }
+.name { font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 </style>

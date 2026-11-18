@@ -61,18 +61,19 @@ describe('异步预览生命周期', () => {
   })
 
   it('旧文本解码完成后不会覆盖新文件', async () => {
-    let finish!: (text: string) => void
-    const pending = new Promise<string>((resolve) => { finish = resolve })
+    let finish!: (buf: ArrayBuffer) => void
+    const pending = new Promise<ArrayBuffer>((resolve) => { finish = resolve })
+    const enc = (t: string) => new TextEncoder().encode(t).buffer as ArrayBuffer
     vi.mocked(fetchFileBlob).mockResolvedValueOnce({
-      size: 3, slice: () => ({ text: () => pending }),
+      size: 3, slice: () => ({ arrayBuffer: () => pending }),
     } as unknown as Blob)
     const w = await setup()
     vi.mocked(fetchFileBlob).mockResolvedValueOnce({
-      size: 3, slice: () => ({ text: async () => 'new content' }),
+      size: 3, slice: () => ({ arrayBuffer: async () => enc('new content') }),
     } as unknown as Blob)
     await w.setProps({ file: { file_name: 'b.txt', container_path: '/workspace/output/b.txt' } })
     await flushPromises()
-    finish('stale content')
+    finish(enc('stale content'))
     await flushPromises()
     expect(document.querySelector('.txt')?.textContent).toBe('new content')
   })

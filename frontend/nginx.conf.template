@@ -19,8 +19,9 @@ server {
     gzip_comp_level 5;
     gzip_types text/css application/javascript text/javascript application/json image/svg+xml;
 
-    # 上传文件走 /send-message,放宽请求体上限
-    client_max_body_size 100m;
+    # 上传文件走 /send-message,放宽请求体上限。比后端 UPLOAD_MAX_TOTAL_MB(默认 100)多留余量给 multipart
+    # 边界和其余表单字段,否则恰好 100MB 的附件会被 nginx 直接 413;调大 UPLOAD_MAX_TOTAL_MB 时这里要同步改
+    client_max_body_size 110m;
 
     # 会话备份导入:后端允许约 1.25GB 的备份包(session_import.MAX_ARCHIVE_BYTES),这里同步放宽,
     # 否则导出成功的大会话会在导入时被 nginx 直接 413。精确匹配优先于下面的正则 location。
@@ -40,7 +41,7 @@ server {
     }
 
     # 后端接口:同源代理,API_KEY 非空时给没带 Key 的请求注入默认身份(单用户部署);多用户部署留空,每人在页面里填自己的 Key
-    location ~ ^/(send-message|stream-events|thread-status|thread-cancel|files|conversations|memories|capabilities|health)(/|$) {
+    location ~ ^/(send-message|stream-events|thread-status|thread-cancel|runs|files|conversations|memories|capabilities|health)(/|$) {
         proxy_pass http://backend:5001;
         proxy_http_version 1.1;
         proxy_set_header Host $host;

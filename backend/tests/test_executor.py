@@ -1,5 +1,6 @@
 """executor 的文件读写逻辑:用内存假会话覆盖 str_replace / insert / view 的边界。"""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from app.tools.executor import (
 
 class FakeSession:
     def __init__(self, files: dict[str, str]) -> None:
+        self.workspace_lock = asyncio.Lock()
         self.files = files
         self.paths = SimpleNamespace(
             virtual_root="/workspace",
@@ -81,6 +83,13 @@ async def test_str_replace_single_match(files):
     files[F] = "one two"
     await str_replace_in_container_file("s", F, "two", "2")
     assert files[F] == "one 2"
+
+
+async def test_str_replace_multiline_in_crlf_file(files):
+    # view_file 去掉了 \r,模型给的多行文本只有 \n;要能匹配上并保持 CRLF
+    files[F] = "a\r\nb\r\nc\r\n"
+    await str_replace_in_container_file("s", F, "a\nb", "x\ny")
+    assert files[F] == "x\r\ny\r\nc\r\n"
 
 
 async def test_missing_file_errors(files):

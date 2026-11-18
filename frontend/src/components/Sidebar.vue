@@ -78,14 +78,21 @@ function openHit(id: string) {
   void chat.openConversation(id)
 }
 
+let renameFrom = ''
 function startRename(id: string, title: string) {
   editing.value = id
-  draft.value = title
+  draft.value = renameFrom = title
 }
 async function commitRename() {
   const id = editing.value
   editing.value = null
-  if (id && draft.value.trim()) await chat.rename(id, draft.value.trim())
+  const title = draft.value.trim()
+  // 没改动或清空了就当取消,不发请求
+  if (id && title && title !== renameFrom) await chat.rename(id, title)
+}
+/** Esc 放弃改名;先清掉 editing,随后的 blur 就不会再提交 */
+function cancelRename() {
+  editing.value = null
 }
 async function exportConversation(id: string, title: string) {
   try {
@@ -107,10 +114,10 @@ async function onImportPicked(e: Event) {
     const r = await importSessionArchive(file)
     await chat.refreshConversations()
     await chat.openConversation(r.id)
-    const notes = [...r.warnings]
-    if (r.missing.length) notes.push(`${r.missing.length} 个文件在备份时已不存在`)
-    const text = `已导入为新会话「${r.title || '未命名'}」${r.resumable ? ',可继续对话' : ''}`
-    if (notes.length) message.warning(`${text}。${notes.join(';')}`, { duration: 8000 })
+    // 备份不含执行上下文:导入的会话只能查看,不能回退或接着原上下文继续
+    const text = `已导入为新会话「${r.title || '未命名'}」(只能查看,不能接着原上下文继续)`
+    if (r.missing.length)
+      message.warning(`${text}。${r.missing.length} 个文件在备份时已不存在`, { duration: 8000 })
     else message.success(text)
   } catch (err) {
     message.error(`导入失败:${errMsg(err)}`)
@@ -118,12 +125,30 @@ async function onImportPicked(e: Event) {
     importing.value = false
   }
 }
-async function backupConversation(id: string) {
+async function backupConversation(id: string, title: string) {
+  // 大会话打包要一会儿,先给个提示,免得以为没点上
+  const pending = message.loading('正在打包备份…', { duration: 0 })
   try {
-    await downloadSessionArchive(id)
+    await downloadSessionArchive(id, title)
   } catch (e) {
     message.error(`备份失败:${errMsg(e)}`)
+  } finally {
+    pending.destroy()
   }
+}
+// 操作收进下拉菜单,标题才能占满整行
+const actionOptions = [
+  { label: '重命名', key: 'rename' },
+  { label: '导出 Markdown', key: 'export' },
+  { label: '备份(zip)', key: 'backup' },
+  { type: 'divider', key: 'd' },
+  { label: () => h('span', { style: 'color: #d03050' }, '删除'), key: 'delete' },
+]
+function onAction(key: string, c: ConversationSummary) {
+  if (key === 'rename') startRename(c.id, c.title)
+  else if (key === 'export') void exportConversation(c.id, c.title)
+  else if (key === 'backup') void backupConversation(c.id, c.title)
+  else if (key === 'delete') confirmDelete(c.id, c.title)
 }
 function confirmDelete(id: string, title: string) {
   dialog.warning({
@@ -146,7 +171,7 @@ function confirmDelete(id: string, title: string) {
       <n-empty v-else-if="hits && hits.length === 0" description="没有匹配的对话" style="margin-top: 24px" />
       <div v-for="hit in hits ?? []" :key="hit.id" class="item hit" :class="{ active: hit.id === chat.sessionId }" @click="openHit(hit.id)">
         <button type="button" class="title" :title="hit.title" @click.stop="openHit(hit.id)">
-          {{ hit.title }}
+          {{ hit.title || '未命名对话' }}
           <span v-if="hit.snippet" class="snippet">{{ hit.snippet }}</span>
         </button>
       </div>
@@ -168,6 +193,7 @@ function confirmDelete(id: string, title: string) {
           autofocus
           @click.stop
           @keydown.enter="(e: KeyboardEvent) => !isImeEnter(e) && commitRename()"
+          @keydown.esc.stop="cancelRename"
           @blur="commitRename"
         />
         <template v-else>
@@ -178,7 +204,7 @@ function confirmDelete(id: string, title: string) {
             :aria-current="c.id === chat.sessionId ? 'true' : undefined"
             @click.stop="chat.openConversation(c.id)"
           >
-            {{ c.title }}
+            {{ c.title || '未命名对话' }}
           </button>
           <span
             v-if="badge(c)"
@@ -188,10 +214,9 @@ function confirmDelete(id: string, title: string) {
             :aria-label="badge(c)!.label"
           />
           <span class="actions" @click.stop>
-            <n-button text size="tiny" @click="startRename(c.id, c.title)">重命名</n-button>
-            <n-button text size="tiny" type="error" @click="confirmDelete(c.id, c.title)">删除</n-button>
-            <n-button text size="tiny" @click="exportConversation(c.id, c.title)">导出</n-button>
-            <n-button text size="tiny" title="打包消息与文件(zip)" @click="backupConversation(c.id)">备份</n-button>
+            <n-dropdown trigger="click" :options="actionOptions" placement="bottom-end" @select="(k: string) => onAction(k, c)">
+              <n-button text size="tiny" class="more" title="更多操作" aria-label="更多操作">⋯</n-button>
+            </n-dropdown>
           </span>
         </template>
       </div>
@@ -244,7 +269,8 @@ function confirmDelete(id: string, title: string) {
 .dot.cancelled { background: var(--muted); }
 @keyframes gen-pulse { 50% { opacity: .3; } }
 .title:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-.actions { display: flex; gap: 8px; margin-left: 8px; opacity: 0; transition: opacity .12s; }
+.actions { display: flex; margin-left: 4px; opacity: 0; transition: opacity .12s; }
+.more { font-size: 16px; padding: 0 4px; letter-spacing: 1px; }
 .item:hover .actions, .item:focus-within .actions { opacity: 1; }
 @media (hover: none) { .actions { opacity: 1; } }
 .list-error { margin: 16px 6px; font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 8px; align-items: flex-start; word-break: break-word; }

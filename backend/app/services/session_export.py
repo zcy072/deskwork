@@ -5,9 +5,9 @@ zip 内容:
   conversation.json   标题、消息(含 parts、用量)与附件元数据
   files/<uploads|output>/...  实际文件
 
-  checkpoint.json     LangGraph 的 checkpoint 与 writes 原始行(base64),导入后可接着原上下文对话;
-                      太大或当前 saver 不支持时省略,原因记在 manifest["checkpoint"]
-不含历史版本和快照。文件读取不跟随符号链接(agent 可写这两个目录);超过单文件或总量上限的文件跳过并记入清单。
+不含 LangGraph checkpoint(执行上下文)、历史版本和快照,导入后的会话只能查看。
+checkpoint 不进备份:安全导入要依赖 LangGraph 私有序列化模块并锁死依赖版本,见 docs/项目导读/07。
+文件读取不跟随符号链接(agent 可写这两个目录);超过单文件或总量上限的文件跳过并记入清单。
 """
 
 import hashlib
@@ -18,23 +18,13 @@ import tempfile
 import time
 import zipfile
 from datetime import UTC, datetime
-from importlib import metadata
 from pathlib import Path
 
 from app.db.models import Conversation, Message
 from app.sandbox.session_paths import SessionPaths
 from app.services.storage import DELETABLE_DIRS
 
-FORMAT_VERSION = 3
-# 修改 Agent 的节点/状态结构或 checkpoint 恢复语义时递增;提示词改动不需要递增。
-GRAPH_VERSION = 1
-CHECKPOINT_PACKAGES = (
-    "langgraph",
-    "langgraph-checkpoint",
-    "langgraph-checkpoint-sqlite",
-    "langchain",
-    "langchain-core",
-)
+FORMAT_VERSION = 5
 MAX_FILE_BYTES = 200 * 1024 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_FILES = 5000
@@ -48,7 +38,10 @@ def _iso(dt: datetime) -> str:
 
 
 def conversation_document(
-    conv: Conversation, messages: list[Message], attachments: dict[int, list[dict]]
+    conv: Conversation,
+    messages: list[Message],
+    attachments: dict[int, list[dict]],
+    runs: dict | None = None,
 ) -> dict:
     return {
         "id": conv.id,
@@ -65,14 +58,21 @@ def conversation_document(
                 "status": m.status,
                 "usage": m.usage,
                 "created_at": _iso(m.created_at),
+                "last_event_seq": m.last_event_seq or 0,
                 **(
                     {
-                        "checkpoint_id": m.checkpoint_id,
-                        "attachments": attachments.get(m.id, []),
+                        "run": {
+                            "status": runs[m.prompt_id].status,
+                            "error_code": runs[m.prompt_id].error_code,
+                            "public_error": runs[m.prompt_id].public_error,
+                            "turn_id": runs[m.prompt_id].turn_id,
+                            "input_committed": runs[m.prompt_id].input_committed,
+                        }
                     }
-                    if m.role == "user"
+                    if runs and m.prompt_id in runs
                     else {}
                 ),
+                **({"attachments": attachments.get(m.id, [])} if m.role == "user" else {}),
             }
             for m in messages
         ],
@@ -133,36 +133,12 @@ def _copy_into_zip(zf: zipfile.ZipFile, arcname: str, src: Path, limit: int) -> 
             os.close(fd)
 
 
-def _checkpoint_info(checkpoint: dict | None, note: str | None) -> dict:
-    if checkpoint is None:
-        return {"included": False, "reason": note or "未导出"}
-    return {
-        "included": True,
-        "checkpoints": len(checkpoint["checkpoints"]),
-        "writes": len(checkpoint["writes"]),
-        "versions": checkpoint_versions(),
-        "graph_version": GRAPH_VERSION,
-    }
-
-
-def checkpoint_versions() -> dict[str, str]:
-    out = {}
-    for name in CHECKPOINT_PACKAGES:
-        try:
-            out[name] = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            pass
-    return out
-
-
 def build_session_archive(
     paths: SessionPaths,
     document: dict,
     dest: Path,
-    checkpoint: dict | None = None,
-    checkpoint_note: str | None = None,
 ) -> dict:
-    """把会话写成 zip 到 dest,返回 manifest。checkpoint 为 None 时在清单里写明原因。"""
+    """把会话写成 zip 到 dest,返回 manifest。"""
     root = paths.session_root.resolve()
     files: list[dict] = []
     skipped: list[dict] = []
@@ -207,12 +183,9 @@ def build_session_archive(
             "files": files,
             "skipped": skipped,
             "missing": missing,
-            "checkpoint": _checkpoint_info(checkpoint, checkpoint_note),
-            "note": "备份消息、uploads/output 文件和 checkpoint;不含历史版本和回退快照。",
+            "note": "备份消息与 uploads/output 文件;不含执行上下文(checkpoint)、历史版本和回退快照,导入后只能查看。",
         }
         zf.writestr("conversation.json", json.dumps(document, ensure_ascii=False, indent=2))
-        if checkpoint is not None:
-            zf.writestr("checkpoint.json", json.dumps(checkpoint, ensure_ascii=False))
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     return manifest
 

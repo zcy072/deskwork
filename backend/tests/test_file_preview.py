@@ -32,7 +32,7 @@ class FakeSession:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, visible_sessions, monkeypatch):
     monkeypatch.setattr(session_paths, "SESSION_ROOT", tmp_path)
     paths = session_paths.SessionPaths.create(SID, tmp_path)
     for d in paths.subdirs:
@@ -182,3 +182,37 @@ async def test_file_changed_during_conversion_is_not_cached(env):
     fake.run_isolated = modify_midway
     await file_preview.office_to_pdf(SID, "uploads/a.docx")
     assert not file_preview._CACHE
+
+
+def test_digest_refuses_fifo_and_symlink_swapped_in_after_locate(env, tmp_path):
+    """_locate 之后源文件被换成 FIFO 或链接:不能阻塞工作线程(会卡住 drain_previews),也不能读到会话外。"""
+    import os
+
+    paths, _ = env
+    src = paths.output / "a.docx"
+    os.mkfifo(src)
+    with pytest.raises(OSError):
+        file_preview._digest(paths.session_root, src)
+    src.unlink()
+    (tmp_path / "outside.docx").write_bytes(b"SECRET")
+    src.symlink_to(tmp_path / "outside.docx")
+    with pytest.raises(OSError):
+        file_preview._digest(paths.session_root, src)
+
+
+def test_conversion_cleanup_does_not_follow_planted_preview_symlink(env, tmp_path):
+    """agent 把 scratchpad/_preview 换成指向会话外的链接时,清理不能顺着删到别处。"""
+    paths, fake = env
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    async def plant(cmd, timeout=None):
+        tag = cmd.split("_preview/")[1].split()[0]
+        (outside / tag).mkdir()
+        (outside / tag / "keep.txt").write_text("keep")
+        (paths.scratchpad / "_preview").symlink_to(outside, target_is_directory=True)
+        return "", False
+
+    fake.run_isolated = plant
+    assert _get("uploads/a.docx").status_code == 422
+    assert [p.name for p in outside.rglob("keep.txt")] == ["keep.txt"]

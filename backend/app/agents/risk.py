@@ -30,11 +30,23 @@ RISKY_COMMAND_PATTERNS = (
 
 
 def _path_in_scratch(path: str, in_scratch_cwd: bool) -> bool:
+    """目标是否只会删到 scratchpad 的直接子项。
+
+    scratchpad 里可能有之前命令建好的符号链接(如 link -> /workspace/output),所以只认直接子项:
+    `rm -rf link` 只删链接本身,而 `link/x`、`link/*`、`link/` 都会穿过链接删到 output 里。
+    代价是删 scratchpad 里子目录中的文件也要确认一次。
+    """
     if ".." in path.split("/") or "$" in path or "`" in path or path.startswith("~"):
         return False
     if path.startswith("/"):
-        return path == SCRATCH or path.startswith(SCRATCH + "/")
-    return in_scratch_cwd
+        if path.rstrip("/") == SCRATCH:
+            return True  # 删整个 scratchpad:rm 不跟随其中的链接
+        if not path.startswith(SCRATCH + "/"):
+            return False
+        path = path[len(SCRATCH) + 1 :]
+    elif not in_scratch_cwd:
+        return False
+    return path not in ("", ".") and "/" not in path
 
 
 _DELETERS = ("rm", "rmdir", "unlink")
@@ -55,11 +67,8 @@ def _rm_only_in_scratch(command: str) -> bool:
             return False
         if words[0] == "cd":
             # 只有 `cd <scratchpad 内绝对路径>` 才算仍在 scratchpad;裸 cd(回家目录)、cd ~、cd - 等一律不算
-            in_scratch_cwd = (
-                len(words) == 2
-                and not words[1].startswith("~")
-                and _path_in_scratch(words[1], False)
-            )
+            # 只认 cd 到 scratchpad 根本身:cd 进它的子目录可能是穿过符号链接进了别处
+            in_scratch_cwd = len(words) == 2 and words[1].rstrip("/") == SCRATCH
             continue
         if words[0] not in _DELETERS:
             if any(re.search(r"\b(rm|rmdir|unlink)\b", w) for w in words):

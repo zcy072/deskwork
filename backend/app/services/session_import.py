@@ -4,8 +4,8 @@
 - zip 条目名只认 manifest 列出的 files/<uploads|output>/...,路径逐段校验;
 - 解压按实际读到的字节数限制,不信 zip 头里声明的大小;
 - 每个文件的 sha256 与大小必须和 manifest 一致;
-- checkpoint 先过 checkpoint_transfer 的类型白名单,再写库;
-- 先写文件和 checkpoint,最后一个事务写数据库,失败时清掉前面写的东西,会话不会半途出现。
+- 备份包不含 checkpoint,导入的会话只能查看,不能回退、重新生成或接着原上下文对话;
+- 先写文件,最后一个事务写数据库,失败时清掉前面写的东西,会话不会半途出现。
 """
 
 import hashlib
@@ -13,29 +13,16 @@ import json
 import os
 import zipfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from app.config import settings
 from app.sandbox.session_paths import SessionPaths
-from app.services.checkpoint_transfer import (
-    CheckpointRejected,
-    ParsedCheckpoint,
-    parse_payload,
-)
-from app.services.session_export import (
-    CHECKPOINT_PACKAGES,
-    FORMAT_VERSION,
-    GRAPH_VERSION,
-    MAX_FILE_BYTES,
-    MAX_FILES,
-    checkpoint_versions,
-)
+from app.services.session_export import FORMAT_VERSION, MAX_FILE_BYTES, MAX_FILES
 from app.services.storage import DELETABLE_DIRS
 
-SUPPORTED_VERSIONS = (1, 2, FORMAT_VERSION)
 MAX_ARCHIVE_BYTES = 1280 * 1024 * 1024
 MAX_JSON_BYTES = 200 * 1024 * 1024
 MAX_MESSAGES = 50000
@@ -56,8 +43,6 @@ class ImportPlan:
     messages: list[dict]
     files: list[dict]  # {"path", "size", "sha256"}
     missing: list[str]
-    checkpoint: ParsedCheckpoint | None = None
-    warnings: list[str] = field(default_factory=list)
 
 
 def _read_json(zf: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int = MAX_JSON_BYTES) -> Any:
@@ -109,6 +94,35 @@ def _str(value: Any, limit: int, what: str) -> str:
     return value
 
 
+def _list_of_dicts(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(x, dict) for x in value)
+
+
+def _part_ok(part: Any) -> bool:
+    """读消息、汇总文件时会直接 .get() 这些字段,结构不对会让整个会话打不开。"""
+    if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+        return False
+    return all(
+        key not in part or _list_of_dicts(part[key]) for key in ("files", "widgets", "sources")
+    )
+
+
+def _count_ok(value: Any) -> bool:
+    return value is None or (type(value) is int and value >= 0)
+
+
+def _usage_ok(usage: dict) -> bool:
+    if not all(_count_ok(v) for k, v in usage.items() if k.endswith(("_tokens", "_calls"))):
+        return False
+    by_model = usage.get("by_model")
+    if by_model is None:
+        return True
+    return isinstance(by_model, dict) and all(
+        isinstance(stat, dict) and all(_count_ok(v) for v in stat.values())
+        for stat in by_model.values()
+    )
+
+
 def _clean_message(raw: Any, index: int, now: datetime) -> dict:
     if not isinstance(raw, dict):
         raise ImportRejected(f"第 {index + 1} 条消息格式不对")
@@ -119,24 +133,46 @@ def _clean_message(raw: Any, index: int, now: datetime) -> dict:
     usage = raw.get("usage")
     if not isinstance(parts, list) or not (usage is None or isinstance(usage, dict)):
         raise ImportRejected(f"第 {index + 1} 条消息的 parts / usage 格式不对")
+    if not all(_part_ok(p) for p in parts) or (usage is not None and not _usage_ok(usage)):
+        raise ImportRejected(f"第 {index + 1} 条消息的 parts / usage 格式不对")
     status = raw.get("status", "complete")
     if status not in ("running", "complete", "error", "cancelled"):
         raise ImportRejected(f"第 {index + 1} 条消息的状态不合法")
-    checkpoint_id = raw.get("checkpoint_id")
-    if checkpoint_id is not None:
-        checkpoint_id = _str(checkpoint_id, 64, "checkpoint_id")
     attachments = raw.get("attachments") or []
+    run = raw.get("run")
+    if run is not None:
+        if not isinstance(run, dict) or run.get("status") not in (
+            "complete",
+            "waiting",
+            "error",
+            "cancelled",
+        ):
+            raise ImportRejected("运行记录格式不对")
+        committed = run.get("input_committed")
+        if committed is not None and type(committed) is not bool:
+            raise ImportRejected("运行输入提交状态格式不对")
+        run = {
+            "status": run["status"],
+            "turn_id": _str(run.get("turn_id") or "", 64, "turn_id"),
+            "error_code": _str(run.get("error_code") or "", 64, "error_code"),
+            "public_error": _str(run.get("public_error") or "", 2000, "public_error"),
+            "input_committed": committed,
+        }
+    seq = raw.get("last_event_seq") or 0
+    if type(seq) is not int or not 0 <= seq < 2**63:
+        raise ImportRejected("事件序号格式不对")
     if not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS:
         raise ImportRejected(f"第 {index + 1} 条消息的附件格式不对")
     return {
         "role": role,
+        "run": run,
+        "last_event_seq": seq,
         "prompt_id": _str(raw.get("prompt_id") or "", 64, "prompt_id"),
         "content": _str(raw.get("content") or "", 10 * MB, "content"),
         "parts": parts,
         # 导出时不会有生成中的会话;包里若仍是 running,说明那一轮没正常结束
         "status": "error" if status == "running" else status,
         "usage": usage,
-        "checkpoint_id": checkpoint_id if role == "user" else None,
         "created_at": _parse_dt(raw.get("created_at"), now),
         "attachments": [
             {
@@ -168,16 +204,15 @@ def inspect_archive(archive: Path) -> ImportPlan:
             raise ImportRejected("缺少 manifest.json 或 conversation.json,不是 Deskwork 备份包")
         manifest = _read_json(zf, by_name["manifest.json"])
         document = _read_json(zf, by_name["conversation.json"])
-        checkpoint_payload = (
-            _read_json(zf, by_name["checkpoint.json"]) if "checkpoint.json" in by_name else None
-        )
 
     if not isinstance(manifest, dict) or not isinstance(document, dict):
         raise ImportRejected("备份包内容格式不对")
     version = manifest.get("format_version")
-    if type(version) is not int or version not in SUPPORTED_VERSIONS:
+    if type(version) is not int or version != FORMAT_VERSION:
+        raise ImportRejected(f"备份包格式版本 {version!r} 不受支持(当前只支持 {FORMAT_VERSION})")
+    if "checkpoint.json" in by_name:
         raise ImportRejected(
-            f"备份包格式版本 {version!r} 不受支持(当前支持 {', '.join(map(str, SUPPORTED_VERSIONS))})"
+            "备份包含 checkpoint.json,不是本版本导出的备份(本版本不导入执行上下文)"
         )
 
     raw_messages = document.get("messages")
@@ -228,57 +263,7 @@ def inspect_archive(archive: Path) -> ImportPlan:
         if isinstance(missing, list)
         else [],
     )
-
-    reason = (
-        checkpoint_incompatibility(manifest.get("checkpoint"))
-        if checkpoint_payload is not None
-        else None
-    )
-    if reason:
-        checkpoint_payload = None
-        plan.warnings.append(f"{reason};已保留消息和文件,未恢复执行上下文,不能接续原上下文或回退")
-    if checkpoint_payload is not None:
-        try:
-            plan.checkpoint = parse_payload(checkpoint_payload)
-        except CheckpointRejected as exc:
-            raise ImportRejected(str(exc)) from exc
-        known = plan.checkpoint.ids
-        lost = 0
-        for m in messages:
-            # "" 是空线程(第一条消息之前),不在 checkpoint 表里
-            if m["checkpoint_id"] and m["checkpoint_id"] not in known:
-                m["checkpoint_id"] = None
-                lost += 1
-        if lost:
-            plan.warnings.append(
-                f"有 {lost} 条消息的 checkpoint 不在备份包里,这些消息不能回退或重新生成"
-            )
-    else:
-        for m in messages:
-            m["checkpoint_id"] = None
-        if not reason:
-            plan.warnings.append("备份包没有 checkpoint,只能查看,不能让助手接着原上下文继续")
     return plan
-
-
-def checkpoint_incompatibility(info: Any) -> str | None:
-    """仅允许已知图结构与完全相同的依赖恢复执行,不推断补丁版本必然兼容。"""
-    if not isinstance(info, dict) or type(info.get("graph_version")) is not int:
-        return "旧备份缺少图结构版本,无法确认 checkpoint 兼容性"
-    if info["graph_version"] != GRAPH_VERSION:
-        return f"备份图结构版本 {info['graph_version']} 与当前版本 {GRAPH_VERSION} 不一致"
-    versions = info.get("versions")
-    if not isinstance(versions, dict):
-        return "备份缺少运行时依赖版本"
-    current = checkpoint_versions()
-    mismatches = []
-    for name in CHECKPOINT_PACKAGES:
-        old, new = versions.get(name), current.get(name)
-        if not isinstance(old, str) or not new or old != new:
-            mismatches.append(f"{name}:备份 {str(old)[:40]} / 当前 {new or '未知'}")
-    if mismatches:
-        return "checkpoint 运行时版本不匹配(" + "; ".join(mismatches) + ")"
-    return None
 
 
 def _make_dir(path: Path, mode: int) -> None:

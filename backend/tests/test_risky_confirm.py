@@ -71,6 +71,15 @@ def _agent(cmd):
         ('grep -iE "xx|yy" f; ls; rm -f /workspace/uploads/a', True),
         ("bash -c 'rm -f /workspace/scratchpad/a'", True),
         ("ls -la /workspace", False),
+        # 之前命令在 scratchpad 里建的链接可能指向 output/:只放行直接子项,穿过链接的路径要确认
+        ("rm -rf /workspace/scratchpad/link/*", True),
+        ("rm -rf /workspace/scratchpad/link/", True),
+        ("rm -f /workspace/scratchpad/link/report.docx", True),
+        ("cd /workspace/scratchpad/link && rm -rf *", True),
+        ("rm -rf /workspace/scratchpad/link", False),
+        ("rm -rf /workspace/scratchpad/*", False),
+        ("cd /workspace/scratchpad/ && rm -rf *", False),
+        ("rm -rf /workspace/scratchpad", False),
         ("python script.py > /workspace/output/r.txt", False),
     ],
 )

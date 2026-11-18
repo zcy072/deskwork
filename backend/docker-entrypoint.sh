@@ -13,7 +13,7 @@ done
 
 if [ -n "$bad" ]; then
     echo "数据目录对 UID $(id -u) 不可写:$bad" >&2
-    echo "多半是旧版本以 root 运行时留下的。在项目根目录执行一次迁移(见 docs/DEPLOY_NON_ROOT.md):" >&2
+    echo "多半是旧版本以 root 运行时留下的。在项目根目录执行一次迁移:" >&2
     echo "  docker compose run --rm --no-deps --user root --entrypoint chown backend -R -h $(id -u):$(id -g) /app/data /app/sandbox_data/sessions" >&2
     exit 1
 fi

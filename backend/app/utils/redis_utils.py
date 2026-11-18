@@ -1,5 +1,4 @@
 import asyncio
-import json
 import time
 from collections.abc import AsyncGenerator
 
@@ -9,13 +8,9 @@ from app.config import settings
 from app.utils.custom_logger import logger
 
 STREAM_PREFIX = "stream:"
-SESSION_PREFIX = "session:"
-THREAD_STATUS_PREFIX = "thread-status:"
 STREAM_TTL_SECONDS = 300
-# 终态状态只需保留一小会儿供前端查询;running 必须覆盖任务的最长运行时间,
-# 否则过期后会被判定为空闲,同一会话可并发启动第二个任务(基线 #6)。
-THREAD_TTL_SECONDS = 400
-THREAD_RUNNING_TTL_SECONDS = 3600
+# 运行中的流每次写入都续期到这个时长;结束后缩短到 STREAM_TTL_SECONDS
+STREAM_RUNNING_TTL_SECONDS = 3600
 # 等待一个尚不存在的流出现的上限(基线 #8)
 STREAM_MISSING_TIMEOUT_SECONDS = 30
 DONE_TOKEN = "[DONE]"
@@ -67,116 +62,38 @@ def _stream_key(prompt_id: str) -> str:
     return f"{STREAM_PREFIX}{prompt_id}"
 
 
-def _thread_status_key(session_id: str) -> str:
-    return f"{THREAD_STATUS_PREFIX}{session_id}"
-
-
-def _session_key(session_id: str) -> str:
-    return f"{SESSION_PREFIX}{session_id}"
-
-
-async def set_thread_status(session_id: str, status: str) -> None:
-    """Persist the current execution status for a LangGraph thread."""
-    redis = _client()
-
-    ttl = THREAD_RUNNING_TTL_SECONDS if status == "running" else THREAD_TTL_SECONDS
-    await redis.set(_thread_status_key(session_id), status, ex=ttl)
-
-
-async def refresh_running_ttl(session_id: str) -> None:
-    """长任务运行期间续期 running 状态,避免超过 1 小时后被判定为空闲而允许并发启动第二个任务。
-
-    同时续期该会话的 prompt 归属记录:否则运行超过 1 小时后客户端重连会因归属记录过期而 404。
-    只在状态仍是 running 时续期,不会把已结束的状态(短 TTL)重新拉长;任务结束后不再续期,
-    归属记录最多再保留一个 TTL。
-    """
-    redis = _client()
-    key = _thread_status_key(session_id)
-    if await redis.get(key) == "running":
-        pipe = redis.pipeline(transaction=False)
-        pipe.expire(key, THREAD_RUNNING_TTL_SECONDS)
-        pipe.expire(_session_key(session_id), THREAD_RUNNING_TTL_SECONDS)
-        await pipe.execute()
-
-
-async def get_thread_status(session_id: str) -> str | None:
-    """Return the stored execution status, or ``None`` for an unknown thread."""
-    redis = _client()
-
-    return await redis.get(_thread_status_key(session_id))
-
-
-async def get_thread_statuses(session_ids: list[str]) -> list[str | None]:
-    """批量读取状态(一次 MGET),顺序与 session_ids 一致。"""
-    if not session_ids:
-        return []
-    return await _client().mget([_thread_status_key(s) for s in session_ids])
-
-
-async def recover_orphaned_runs() -> int:
-    """启动时调用:此刻 Redis 里仍是 running 的会话,其任务属于上一个进程,已经不存在了。
-
-    把状态改成 error 并给它的流补上结束标记,否则客户端会一直重连,
-    同一会话在 running 的 1 小时 TTL 内也发不了新消息(409)。返回处理的会话数。
-    """
-    redis = _client()
-
-    recovered = 0
-    async for key in redis.scan_iter(match=f"{THREAD_STATUS_PREFIX}*"):
-        if await redis.get(key) != "running":
-            continue
-        session_id = key[len(THREAD_STATUS_PREFIX) :]
-        await set_thread_status(session_id, "error")
-        for prompt_id in await redis.smembers(_session_key(session_id)):
-            stream_key = _stream_key(prompt_id)
-            if not await redis.exists(stream_key):
-                continue
-            error = json.dumps(
-                {"event": "error", "data": {"message": "服务重启,本次生成已中断"}},
-            )
-            end = json.dumps({"event": "stream.end", "data": {}})
-            await redis.xadd(stream_key, {"token": error})
-            await redis.xadd(stream_key, {"token": end})
-            await mark_done(prompt_id)
-        recovered += 1
-    return recovered
-
-
-async def register_prompt(session_id: str, prompt_id: str) -> None:
-    """Record that a prompt_id belongs to a session_id."""
-    redis = _client()
-
-    key = _session_key(session_id)
-    await redis.sadd(key, prompt_id)
-    # 归属记录必须覆盖任务的最长运行时间:任务跑过 STREAM_TTL 后客户端重连会校验归属,
-    # 记录过期就会 404(评测中 300s+ 的 PPT 任务触发过)。流本身的过期由 mark_done 控制。
-    await redis.expire(key, THREAD_RUNNING_TTL_SECONDS)
-
-
-async def prompt_belongs_to_session(session_id: str, prompt_id: str) -> bool:
-    """Return True if prompt_id was registered under session_id."""
-    redis = _client()
-
-    return bool(await redis.sismember(_session_key(session_id), prompt_id))
-
-
 async def add_token(prompt_id: str, token: str) -> None:
     redis = _client()
 
     key = _stream_key(prompt_id)
-    # 运行中也带过期:进程被杀、来不及 mark_done 时流不会永久留在 Redis 里。
-    # 每次写入都续期,覆盖超过一小时的长任务;mark_done 再把它缩短到 STREAM_TTL。
+    # 运行中也带过期:进程被杀、来不及结束时流不会永久留在 Redis 里。
+    # 每次写入都续期,覆盖超过一小时的长任务;finish_existing_stream 再把它缩短到 STREAM_TTL。
     await redis.xadd(key, {"token": token})
-    await redis.expire(key, THREAD_RUNNING_TTL_SECONDS)
+    await redis.expire(key, STREAM_RUNNING_TTL_SECONDS)
 
 
-async def mark_done(prompt_id: str) -> None:
-    redis = _client()
+async def append_existing(prompt_id: str, token: str) -> None:
+    """Do not silently recreate a stream whose earlier events were lost."""
+    result = await _client().eval(
+        "if redis.call('EXISTS', KEYS[1]) == 0 then return false end "
+        "local id = redis.call('XADD', KEYS[1], '*', 'token', ARGV[1]); "
+        "redis.call('EXPIRE', KEYS[1], ARGV[2]); return id",
+        1,
+        _stream_key(prompt_id),
+        token,
+        STREAM_RUNNING_TTL_SECONDS,
+    )
+    if not result:
+        raise RuntimeError("Run event stream was lost")
 
-    key = _stream_key(prompt_id)
-    await redis.xadd(key, {"token": DONE_TOKEN})
-    await redis.expire(key, STREAM_TTL_SECONDS)
-    logger.debug(f"Marked stream '{key}' as DONE with TTL={STREAM_TTL_SECONDS}s")
+
+async def stream_exists(prompt_id: str) -> bool:
+    return bool(await _client().exists(_stream_key(prompt_id)))
+
+
+async def finish_existing_stream(prompt_id: str) -> None:
+    await append_existing(prompt_id, DONE_TOKEN)
+    await _client().expire(_stream_key(prompt_id), STREAM_TTL_SECONDS)
 
 
 async def read_stream(
@@ -227,11 +144,7 @@ async def incr_with_ttl(key: str, ttl_seconds: int) -> int:
     return int(count)
 
 
-async def purge_session(session_id: str) -> None:
-    """删除会话相关的全部 Redis 键:线程状态、prompt 登记集合,以及这些 prompt 的事件流。"""
-    redis = _client()
-
-    session_key = _session_key(session_id)
-    prompt_ids = await redis.smembers(session_key)
-    keys = [_thread_status_key(session_id), session_key, *map(_stream_key, prompt_ids)]
-    await redis.delete(*keys)
+async def purge_streams(prompt_ids: list[str]) -> None:
+    """删除会话各轮的事件流;run id 来自数据库,流本身也带过期,漏删最多多留一小时。"""
+    if prompt_ids:
+        await _client().delete(*map(_stream_key, prompt_ids))

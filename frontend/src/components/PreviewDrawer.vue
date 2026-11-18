@@ -4,6 +4,7 @@ import { downloadFile, fetchFileBlob, fetchPreviewBlob, saveBlob } from '@/api/c
 import type { FileRef } from '@/types'
 import { toRelativePath } from '@/utils/files'
 import { mimeOf, parseCsv, previewKind } from '@/utils/preview'
+import { decodeText } from '@/utils/decodeText'
 import { errMsg } from '@/utils/errors'
 import { isImeEnter } from '@/utils/keys'
 
@@ -23,8 +24,6 @@ function submitRevision() {
   request.value = ''
 }
 
-/** 窄屏上不超过视口宽度 */
-const drawerWidth = 'min(640px, 100vw)'
 const MAX_TEXT = 1024 * 1024
 const loading = ref(false)
 const error = ref<string | null>(null)
@@ -36,6 +35,10 @@ const blob = ref<Blob | null>(null)
 let seq = 0
 
 const kind = computed(() => (props.file ? previewKind(props.file.file_name) : 'none'))
+/** PDF/Office 预览给宽一些;窄屏上不超过视口宽度 */
+const drawerWidth = computed(() => (kind.value === 'pdf' || kind.value === 'office' ? 'min(900px, 100vw)' : 'min(640px, 100vw)'))
+/** 让浏览器 PDF 阅读器按页宽缩放,免得左右滚动(view=FitH 给 Chrome,zoom=page-width 给 Firefox) */
+const pdfSrc = computed(() => (url.value ? `${url.value}#view=FitH&zoom=page-width` : ''))
 
 function reset() {
   if (url.value) URL.revokeObjectURL(url.value)
@@ -67,7 +70,7 @@ watch(
       if (k === 'image' || k === 'pdf' || k === 'office') url.value = URL.createObjectURL(b)
       else {
         truncated.value = b.size > MAX_TEXT
-        const t = await b.slice(0, MAX_TEXT).text()
+        const t = await decodeText(b.slice(0, MAX_TEXT))
         if (mine !== seq) return
         if (k === 'csv') rows.value = parseCsv(t)
         else text.value = t
@@ -110,7 +113,7 @@ async function save() {
       <n-alert v-else-if="error" type="error">{{ error }}</n-alert>
       <n-empty v-else-if="kind === 'none'" description="暂不支持预览该类型,请下载后查看" />
       <img v-else-if="kind === 'image' && url" :src="url" class="img" :alt="file?.file_name" />
-      <iframe v-else-if="(kind === 'pdf' || kind === 'office') && url" :src="url" class="pdf" title="PDF 预览" />
+      <iframe v-else-if="(kind === 'pdf' || kind === 'office') && url" :src="pdfSrc" class="pdf" title="PDF 预览" />
       <div v-else-if="kind === 'csv'" class="tbl">
         <table>
           <tr v-for="(r, i) in rows" :key="i" :class="{ h: i === 0 }">

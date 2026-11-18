@@ -7,13 +7,19 @@ from app import app
 from app.api import security
 from app.api.routes import stream
 from app.config import settings
+from app.db import close_db, init_db
 from app.sandbox import session_paths
+from tests.history_seed import seed_user_turn
 
 
 @pytest.fixture
-async def client(monkeypatch):
+async def client(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "API_KEYS", "")
-    monkeypatch.setattr(stream, "is_db_ready", lambda: False)
+    monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path / "db"))
+    monkeypatch.setattr(settings, "DATABASE_URL", "")
+    await close_db()
+    await init_db()
+    await seed_user_turn("s1", "p1", "hi")
 
     async def one(key, ttl):
         return 1
@@ -21,6 +27,7 @@ async def client(monkeypatch):
     monkeypatch.setattr(security, "incr_with_ttl", one)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         yield c
+    await close_db()
 
 
 @pytest.fixture
@@ -63,24 +70,31 @@ async def test_download_missing_file_is_404(client, root):
     assert (await _get(client, "output/nope.txt")).status_code == 404
 
 
-async def test_stream_events_unknown_prompt_is_404(client, monkeypatch):
-    async def no(_s, _p):
-        return False
-
-    monkeypatch.setattr("app.services.chat_operations.prompt_belongs_to_session", no)
-    r = await client.post("/stream-events", json={"session_id": "s1", "prompt_id": "p1"})
+async def test_stream_events_unknown_prompt_is_404(client):
+    r = await client.post("/stream-events", json={"session_id": "s1", "prompt_id": "other"})
+    assert r.status_code == 404
+    r = await client.post("/stream-events", json={"session_id": "nope", "prompt_id": "p1"})
     assert r.status_code == 404
 
 
+async def test_stream_events_expired_stream_is_410(client, monkeypatch):
+    async def gone(_p):
+        return False
+
+    monkeypatch.setattr("app.services.chat_operations.stream_exists", gone)
+    r = await client.post("/stream-events", json={"session_id": "s1", "prompt_id": "p1"})
+    assert r.status_code == 410
+
+
 async def test_stream_events_empty_stream_returns_empty_body(client, monkeypatch):
-    async def yes(_s, _p):
+    async def yes(_p):
         return True
 
     async def empty(*_a, **_k):
         return
         yield  # pragma: no cover
 
-    monkeypatch.setattr("app.services.chat_operations.prompt_belongs_to_session", yes)
+    monkeypatch.setattr("app.services.chat_operations.stream_exists", yes)
     monkeypatch.setattr("app.services.chat_operations.read_stream", empty)
     r = await client.post("/stream-events", json={"session_id": "s1", "prompt_id": "p1"})
     assert r.status_code == 200 and r.text == ""

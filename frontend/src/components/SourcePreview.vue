@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { fetchFileBlob, saveBlob } from '@/api/client'
 import type { SourceRef } from '@/types'
+import { decodeText } from '@/utils/decodeText'
 import { errMsg } from '@/utils/errors'
 import { toRelativePath } from '@/utils/files'
 import { locationLabel, sourceLabel } from '@/utils/sources'
@@ -15,7 +16,7 @@ const blob = ref<Blob | null>(null)
 const lines = ref<{ number: number; text: string; selected: boolean }[]>([])
 let seq = 0
 const title = computed(() => props.source ? sourceLabel(props.source) : '原文引用')
-const pdfUrl = computed(() => url.value && props.source?.location.kind === 'page' ? `${url.value}#page=${props.source.location.page}` : null)
+const pdfUrl = computed(() => url.value && props.source?.location.kind === 'page' ? `${url.value}#page=${props.source.location.page}&view=FitH&zoom=page-width` : null)
 function reset() {
   if (url.value) URL.revokeObjectURL(url.value)
   url.value = null
@@ -39,7 +40,7 @@ watch(() => [props.source, props.sessionId] as const, async ([source, sid]) => {
     } else if (source.location.kind === 'page') {
       url.value = URL.createObjectURL(new Blob([raw], { type: 'application/pdf' }))
     } else {
-      const text = await raw.text()
+      const text = await decodeText(raw)
       if (mine !== seq) return
       const { start, end } = source.location
       lines.value = text.split('\n').slice(Math.max(0, start - 4), end + 3).map((text, i) => {

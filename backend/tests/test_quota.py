@@ -2,6 +2,8 @@
 
 import asyncio
 import re
+import shlex
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +38,7 @@ def test_dir_size_missing_dir_is_zero(tmp_path):
         "du -sh *",
         "ls -la && du -sh .",
         "cd output; rm a b",
+        "find /workspace/scratchpad -name '*.tmp' -delete",
     ],
 )
 def test_cleanup_commands_allowed(command):
@@ -52,6 +55,11 @@ def test_cleanup_commands_allowed(command):
         "cat big | tee more",
         r"find . -exec cp {} x \;",
         "find . -fprint out",
+        "rm x & python3 gen.py",
+        "echo & dd if=/dev/zero of=big",
+        "/usr/bin/find . -fprint f",
+        r"find . -execdir cp {} x \;",
+        r"find . -ok cp {} x \;",
         "",
     ],
 )
@@ -78,7 +86,7 @@ class FakeClient:
         self.proc = None
         self.scripts = []
 
-    async def spawn(self, container, argv, user=None):
+    async def spawn(self, container, argv):
         self.proc = FakeProcess()
         return self.proc
 
@@ -101,7 +109,7 @@ def session(tmp_path, monkeypatch):
     paths = SessionPaths.create("quota-test", sessions_root=tmp_path)
     paths.scratchpad.mkdir(parents=True)
     client = FakeClient()
-    return BashSession(paths, docker_client=client), paths, client
+    return BashSession(paths, manager_client=client), paths, client
 
 
 async def test_over_quota_blocks_normal_commands_but_allows_cleanup(session, monkeypatch):
@@ -140,6 +148,25 @@ async def test_file_size_ulimit_set_at_shell_start(session, monkeypatch):
     assert any("ulimit -f 7168" in s for s in client.scripts)
 
 
+async def test_process_limit_set_inside_bwrap(session, monkeypatch):
+    """进程数上限按 bwrap 新建的 user namespace 计数,必须在 bwrap 里面设才是按会话。"""
+    sess, _, client = session
+    monkeypatch.setattr(settings, "SESSION_MAX_PROCS", 64)
+    await sess.execute("echo hi")
+    assert any("ulimit -u 64" in s for s in client.scripts)
+
+    seen = []
+
+    async def run_exec(_container, script, timeout=None):
+        seen.append(script)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    client.run_exec = run_exec
+    await sess.run_isolated("true")
+    inner = shlex.split(seen[0].split("exec ", 1)[1])[-1]
+    assert inner.startswith("ulimit -u 64\n") and inner.endswith("true")
+
+
 async def test_upload_rejected_when_it_would_exceed_quota(tmp_path, monkeypatch):
     class Sess:
         class paths:
@@ -161,8 +188,8 @@ async def test_upload_rejected_when_it_would_exceed_quota(tmp_path, monkeypatch)
 
 async def test_too_many_concurrent_runs_rejected(monkeypatch):
     monkeypatch.setattr(settings, "MAX_CONCURRENT_RUNS", 2)
-    monkeypatch.setitem(ops._active_agent_tasks, "a", object())
-    monkeypatch.setitem(ops._active_agent_tasks, "b", object())
+    ops.sessions.reserve("a")
+    ops.sessions.reserve("b")
     with pytest.raises(ops.TooManyRunsError):
         await ops.start_chat("c", "hi", [])
 
@@ -170,12 +197,7 @@ async def test_too_many_concurrent_runs_rejected(monkeypatch):
 async def test_run_limit_does_not_block_session_already_counted(monkeypatch):
     """已占用名额的会话再发消息应走原来的 409 逻辑,而不是 429。"""
     monkeypatch.setattr(settings, "MAX_CONCURRENT_RUNS", 1)
-    monkeypatch.setitem(ops._active_agent_tasks, "a", object())
-
-    async def running(_sid):
-        return "running"
-
-    monkeypatch.setattr(ops, "get_thread_status", running)
+    ops.sessions.reserve("a")
     with pytest.raises(ops.ActiveRunError):
         await ops.start_chat("a", "hi", [])
 
@@ -205,3 +227,19 @@ async def test_usage_measured_after_command_is_reused_before_next(session, monke
     sess._usage = (sess._usage[0] - bash_handler.USAGE_CACHE_SEC - 1, sess._usage[1])
     await sess.execute("echo c")
     assert len(calls) == 5  # 过期后命令前重新测量
+
+
+async def test_memory_limit_set_inside_bwrap(session, monkeypatch):
+    sess, _, client = session
+    monkeypatch.setattr(settings, "SESSION_MAX_MEMORY_MB", 512)
+    await sess.execute("echo hi")
+    assert any("ulimit -d 524288" in s for s in client.scripts)
+
+
+def test_sigkill_exit_explains_memory_limit(monkeypatch):
+    from app.sandbox.bash_handler import _exit_note
+
+    monkeypatch.setattr(settings, "SESSION_MAX_MEMORY_MB", 512)
+    assert "512 MB" in _exit_note(137) and _exit_note(1) == ""
+    monkeypatch.setattr(settings, "SESSION_MAX_MEMORY_MB", 0)
+    assert _exit_note(137) == ""

@@ -3,6 +3,7 @@ from functools import cache
 from pathlib import Path
 from urllib.parse import quote
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -26,6 +27,9 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.0
     # Anthropic 协议必须显式给出单次回复的输出上限;一次写很长的文件或脚本被截断时调大
     LLM_MAX_TOKENS: int = 8192
+    LLM_REQUEST_TIMEOUT_SECONDS: float = Field(default=180, gt=0)
+    # 每个执行片段的墙钟上限;人工等待不占用片段,0 表示关闭总上限。
+    AGENT_RUN_TIMEOUT_SECONDS: float = Field(default=1800, ge=0)
     # 主模型使用命名配置 LLM_<PROFILE>_*(留空 = 默认的 LLM_*);用于不改 .env 切换模型做对比
     LLM_PROFILE: str = ""
     # 主模型调用失败时按顺序切换的命名配置,逗号分隔,如 "deepseek,anthropic"
@@ -64,6 +68,14 @@ class Settings(BaseSettings):
     # 超限后只放行 rm / ls / du / find 等清理命令。同时运行的会话数超限时新请求返回 429
     SESSION_MAX_STORAGE_MB: int = 1024
     SESSION_MAX_FILE_MB: int = 200
+    # 每个会话(bwrap 实例)最多的进程+线程数,防 fork 炸弹拖垮其他会话。bwrap 为每个会话新建 user namespace,
+    # 内核按 namespace 计数,所以是按会话而不是按 agent 用户总数。LibreOffice / numpy 在 128 下实测正常。
+    SESSION_MAX_PROCS: int = 128
+    # 每个会话的内存上限(MB)。容器内 cgroup 只读、RLIMIT_AS 会让 sharp/onnxruntime 启动即崩,所以分两层:
+    # bwrap 内 ulimit -d(单进程堆上限,大分配直接失败);沙箱容器里的看门狗 sandbox/memwatch.py
+    # 按会话合计 PSS,超出则杀掉该会话里占用最大的进程(退出码 137)。看门狗读同名环境变量,两边须一致。
+    # 容器整体 mem_limit 仍是最后防线。soffice / pymupdf / pandas 常见任务实测峰值 PSS 均在 200MB 以内
+    SESSION_MAX_MEMORY_MB: int = 1024
     MAX_CONCURRENT_RUNS: int = 4
     # 每个会话的 bash 常驻一个沙箱进程,并占 sandbox-manager 的一个 spawn 名额(MANAGER_MAX_SPAWN,默认 32)。
     # 空闲超过 SANDBOX_SHELL_IDLE_SEC 秒的 shell 会被关闭,存活数超过 SANDBOX_MAX_SHELLS 时关闭最久未用的;
@@ -172,7 +184,7 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        return self.DATABASE_URL or f"sqlite+aiosqlite:///{self.data_dir / 'workmate.sqlite'}"
+        return self.DATABASE_URL or f"sqlite+aiosqlite:///{self.data_dir / 'deskwork.sqlite'}"
 
     @property
     def checkpoint_db_path(self) -> Path:

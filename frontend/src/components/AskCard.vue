@@ -27,7 +27,7 @@ function submit() {
     <div class="q">{{ question }}</div>
     <template v-if="kind === 'single_select'">
       <n-space vertical>
-        <n-button v-for="o in options" :key="o" block secondary :disabled="!active" @click="emit('answer', o)">
+        <n-button v-for="o in options" :key="o" block secondary class="opt" :disabled="!active" @click="emit('answer', o)">
           {{ o }}
         </n-button>
       </n-space>
@@ -57,7 +57,11 @@ function submit() {
 
 <style scoped>
 .ask { margin: 10px 0; max-width: 440px; border-radius: 14px; box-shadow: var(--shadow); border-left: 3px solid var(--accent); }
-.q { font-weight: 600; margin-bottom: 8px; }
+.q { font-weight: 600; margin-bottom: 8px; overflow-wrap: anywhere; }
+/* 选项按钮默认不换行,长选项会被卡片截断;允许折行、左对齐,按钮随内容变高 */
+.opt { height: auto; min-height: 34px; padding-top: 6px; padding-bottom: 6px; justify-content: flex-start; text-align: left; }
+.opt :deep(.n-button__content) { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
+.ask :deep(.n-checkbox__label) { overflow-wrap: anywhere; }
 .go { margin-top: 8px; }
 .skip { margin-top: 6px; display: block; }
 .done { display: block; margin-top: 6px; font-size: 12px; }

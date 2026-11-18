@@ -1,5 +1,6 @@
 """present_files 覆盖同名产物时保留历史版本。"""
 
+import asyncio
 import os
 from types import SimpleNamespace
 
@@ -66,15 +67,17 @@ def test_symlink_dest_not_archived(paths, tmp_path):
 async def test_present_archives_previous(paths, monkeypatch):
     src = paths.scratchpad / "a.txt"
     session = SimpleNamespace(
+        workspace_lock=asyncio.Lock(),
         paths=SimpleNamespace(
             output=paths.output,
             session_root=paths.session_root,
             virtual_root="/workspace",
             virtual_to_container_path=lambda v: v,
             virtual_to_host_path=lambda v: src,
+            trusted_root=lambda v: paths.session_root,
         ),
         resolve_virtual_path=lambda raw: "/workspace/scratchpad/a.txt",
-        docker_client=None,
+        manager_client=None,
         container_name="c",
     )
 
@@ -151,21 +154,19 @@ def test_failed_snapshot_copy_keeps_last_successful_delivery(paths, monkeypatch)
     _overwrite(paths, "v1", 1_000)
     dest = paths.output / "a.txt"
     dest.write_text("v2")
-    real_copy = fv.shutil.copy2
+    from app.sandbox import host_files
 
-    def fail_current(source, target):
-        if target.name.startswith(".delivery-"):
-            raise OSError("disk full")
-        return real_copy(source, target)
+    def fail_copy(_src, _dst, _length=0):
+        raise OSError("disk full")
 
-    monkeypatch.setattr(fv.shutil, "copy2", fail_current)
+    monkeypatch.setattr(host_files.shutil, "copyfileobj", fail_copy)
     fv.finish_archive(paths, dest, fv.archive_previous(paths, dest))
     directory = paths.session_root / "versions" / "a.txt"
     assert (directory / fv.CURRENT).read_text() == "v1"
     assert not list(directory.glob(".delivery-*"))
 
 
-def test_version_routes(tmp_path, monkeypatch):
+def test_version_routes(tmp_path, visible_sessions, monkeypatch):
     from fastapi.testclient import TestClient
 
     from app import app
@@ -236,15 +237,17 @@ def test_find_delivered_rejects_bad_name(paths):
 async def test_present_records_digest(paths, monkeypatch):
     src = paths.scratchpad / "a.txt"
     session = SimpleNamespace(
+        workspace_lock=asyncio.Lock(),
         paths=SimpleNamespace(
             output=paths.output,
             session_root=paths.session_root,
             virtual_root="/workspace",
             virtual_to_container_path=lambda v: v,
             virtual_to_host_path=lambda v: src,
+            trusted_root=lambda v: paths.session_root,
         ),
         resolve_virtual_path=lambda raw: "/workspace/scratchpad/a.txt",
-        docker_client=None,
+        manager_client=None,
         container_name="c",
     )
 

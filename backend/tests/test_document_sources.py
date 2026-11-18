@@ -127,7 +127,7 @@ def test_uncitable_document_has_no_made_up_sources():
     assert source_references(index, index.search("内容")) == []
 
 
-def test_verified_download_rejects_changed_file(paths):
+def test_verified_download_rejects_changed_file(paths, visible_sessions):
     source = paths.uploads / "a.txt"
     source.write_text("原文预算 100 元")
     digest = source_fingerprint(paths, "uploads/a.txt")
@@ -318,3 +318,36 @@ async def test_search_emits_sources_and_recorder_preserves_them(monkeypatch):
     recorder.record(event, payload)
     assert recorder.parts == [{"type": "sources", "sources": payload["sources"]}]
     assert payload["sources"][0]["id"] in result.update["messages"][0].content
+
+
+async def test_scanned_pdf_without_text_layer_asks_for_ocr(paths, monkeypatch):
+    """扫描件每页都没有文字:要明确说需要 OCR,不能返回"共 0 段、没找到"误导模型。"""
+    (paths.uploads / "scan.pdf").write_bytes(b"%PDF-fixture")
+
+    async def execute(command, timeout):
+        output = paths.scratchpad / "_rag" / shlex.split(command)[-1].rsplit("/", 1)[-1]
+        output.parent.mkdir()
+        output.write_text(json.dumps(["", " \n", ""]))
+        return "", False
+
+    async def is_file(_):
+        return True
+
+    fake_paths = SimpleNamespace(
+        virtual_root="/workspace",
+        scratchpad=paths.scratchpad,
+        virtual_to_container_path=lambda p: p,
+        read_host_file=paths.read_host_file,
+        resolve_host_path=paths.resolve_host_path,
+        session_root=paths.session_root,
+    )
+    session = SimpleNamespace(
+        paths=fake_paths, resolve_virtual_path=lambda p: p, is_file=is_file, execute=execute
+    )
+
+    async def get_session(_):
+        return session
+
+    monkeypatch.setattr(doc_search.CONTAINER_MANAGER, "get_or_create", get_session)
+    with pytest.raises(doc_search.ToolFeedbackError, match="OCR"):
+        await doc_search._build_index(paths.session_id, "/workspace/uploads/scan.pdf")

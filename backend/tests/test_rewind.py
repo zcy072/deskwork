@@ -1,17 +1,19 @@
-"""编辑重发 / 重新生成:checkpoint 回退、消息截断、旧库补列。"""
+"""编辑重发 / 重新生成:checkpoint 回退、消息截断、旧库补列。
+
+回退到某条消息走 start_chat(rewind_to_message_id=...) 的生产路径;并行回答、快照等
+更复杂的回退场景在 test_run_recovery / test_rewind_parallel_answers。"""
 
 import sqlite3
 
 import pytest
-from langchain.agents import create_agent
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import AIMessage
 
 from app.config import settings
-from app.db import close_db, init_db, repository
+from app.db import close_db, init_db, repository, runs
+from app.runtime.sessions import sessions
 from app.services import chat_operations as chat
-from app.services.history import TurnRecorder, persist_assistant_turn, persist_user_turn
+from tests.history_seed import seed_legacy_turn, seed_user_turn
+from tests.test_run_recovery import runtime as _runtime
 
 
 @pytest.fixture
@@ -24,41 +26,27 @@ async def db(tmp_path, monkeypatch):
     await close_db()
 
 
-def _replies():
-    i = 0
-    while True:
-        i += 1
-        yield AIMessage(content=f"r{i}")
-
-
-@pytest.fixture
-def agent(monkeypatch):
-    saver = InMemorySaver()
-    ag = create_agent(model=GenericFakeChatModel(messages=_replies()), tools=[], checkpointer=saver)
-    monkeypatch.setattr(chat, "get_agent", lambda: ag)
-    monkeypatch.setattr(chat, "get_checkpointer", lambda: saver)
-    return ag
-
-
-async def _texts(agent, sid):
-    state = await agent.aget_state({"configurable": {"thread_id": sid}})
-    return [m.content for m in state.values.get("messages", [])]
-
-
-async def _turn(agent, sid, text, files=()):
-    """模拟 start_chat + _run_agent 的落库与 checkpoint 记录,不经过 Redis。"""
-    config = {"configurable": {"thread_id": sid}}
-    prompt_id = f"p-{text}"
-    await persist_user_turn(sid, prompt_id, text, list(files))
-    await chat._record_checkpoint(agent, config, sid, prompt_id)
-    await agent.ainvoke({"messages": [HumanMessage(text)]}, config)
-    r = TurnRecorder()
-    r.record("ai.token", {"text": f"reply-{text}"})
-    await persist_assistant_turn(sid, prompt_id, r, "complete")
+rewind_runtime = pytest.fixture(_runtime.__wrapped__, name="rewind_runtime")
 
 
 async def _user_ids(sid):
     return [m.id for m in await repository.get_messages(sid) if m.role == "user"]
+
+
+async def _texts(sid):
+    """图里的消息正文;用户输入在图里带 <user_query> 包装,这里剥掉。"""
+    state = await chat.get_agent().aget_state(await runs.graph_config(sid))
+    return [
+        m.content.removeprefix("<user_query>\n").removesuffix("\n</user_query>")
+        for m in state.values.get("messages", [])
+    ]
+
+
+async def _turn(text, files=(), **kwargs):
+    """经 start_chat 跑完整一轮(运行回执、checkpoint、快照都走生产路径)。"""
+    pid = await chat.start_chat("s", text, [], **kwargs)
+    await sessions.get("s").task
+    return await runs.get(pid)
 
 
 # ---------- 旧库补列 ----------
@@ -81,7 +69,7 @@ async def test_init_db_adds_missing_checkpoint_column(tmp_path, monkeypatch):
 
     await init_db()  # 应自动补回
     try:
-        await persist_user_turn("s", "p", "hi", [])
+        await seed_legacy_turn("s", "p", "hi")
         msg = (await repository.get_messages("s"))[0]
         assert msg.checkpoint_id is None
     finally:
@@ -92,8 +80,8 @@ async def test_init_db_adds_missing_checkpoint_column(tmp_path, monkeypatch):
 
 
 async def test_truncate_from_removes_tail_and_file_rows(db):
-    await persist_user_turn("s", "p1", "a", [{"file_name": "x", "container_path": "/w/x"}])
-    await persist_user_turn("s", "p2", "b", [{"file_name": "y", "container_path": "/w/y"}])
+    await seed_legacy_turn("s", "p1", "a", files=[{"file_name": "x", "container_path": "/w/x"}])
+    await seed_legacy_turn("s", "p2", "b", files=[{"file_name": "y", "container_path": "/w/y"}])
     first, second = await _user_ids("s")
 
     assert await repository.truncate_from("s", second) == 1
@@ -105,73 +93,56 @@ async def test_truncate_from_removes_tail_and_file_rows(db):
 
 
 async def test_get_message_checks_conversation(db):
-    await persist_user_turn("s", "p", "a", [])
+    await seed_user_turn("s", "p", "a", [])
     (mid,) = await _user_ids("s")
     assert await repository.get_message("s", mid) is not None
     assert await repository.get_message("other", mid) is None
 
 
-# ---------- _rewind ----------
+# ---------- 编辑重发(start_chat 的 rewind_to_message_id) ----------
 
 
-async def test_rewind_to_middle_message_keeps_earlier_context(db, agent):
-    await _turn(agent, "s", "a")
-    await _turn(agent, "s", "b")
+async def test_rewind_to_middle_message_keeps_earlier_context(rewind_runtime):
+    rewind_runtime.graph([AIMessage(content=f"r{i}") for i in range(1, 4)])
+    await _turn("a")
+    await _turn("b")
     _, second = await _user_ids("s")
-    assert await _texts(agent, "s") == ["a", "r1", "b", "r2"]
+    assert await _texts("s") == ["a", "r1", "b", "r2"]
 
-    await chat._rewind("s", second)
+    run = await _turn("b2", rewind_to_message_id=second)
 
-    assert await _texts(agent, "s") == ["a", "r1"]
-    remaining = await repository.get_messages("s")
-    assert [m.content for m in remaining] == ["a", "reply-a"]
+    assert run.status == "complete"
+    assert await _texts("s") == ["a", "r1", "b2", "r3"]
+    assert [m.content for m in await repository.get_messages("s")] == ["a", "r1", "b2", "r3"]
 
 
-async def test_rewind_to_first_message_clears_thread(db, agent):
-    await _turn(agent, "s", "a")
+async def test_rewind_to_first_message_replaces_whole_thread(rewind_runtime):
+    rewind_runtime.graph([AIMessage(content="r1"), AIMessage(content="r2")])
+    await _turn("a")
     (first,) = await _user_ids("s")
 
-    await chat._rewind("s", first)
+    await _turn("a2", rewind_to_message_id=first)
 
-    assert await _texts(agent, "s") == []
-    assert await repository.get_messages("s") == []
-
-
-async def test_rewind_then_continue_replaces_branch(db, agent):
-    await _turn(agent, "s", "a")
-    await _turn(agent, "s", "b")
-    _, second = await _user_ids("s")
-
-    await chat._rewind("s", second)
-    await _turn(agent, "s", "b2")
-
-    assert await _texts(agent, "s") == ["a", "r1", "b2", "r3"]
+    assert await _texts("s") == ["a2", "r2"]
+    assert [m.content for m in await repository.get_messages("s")] == ["a2", "r2"]
 
 
-async def test_rewind_returns_original_attachments(db, agent):
-    await _turn(agent, "s", "a", [{"file_name": "f.csv", "container_path": "/w/f.csv"}])
-    (first,) = await _user_ids("s")
-
-    assert await chat._rewind("s", first) == [{"file_name": "f.csv", "container_path": "/w/f.csv"}]
-
-
-async def test_rewind_rejects_assistant_unknown_and_untracked(db, agent):
-    await _turn(agent, "s", "a")
+async def test_rewind_rejects_assistant_unknown_and_foreign_messages(rewind_runtime):
+    await _turn("a")
     assistant = next(m for m in await repository.get_messages("s") if m.role == "assistant")
+    for target in (assistant.id, 9999):
+        with pytest.raises(chat.RewindError):
+            await chat.start_chat("s", "x", [], rewind_to_message_id=target)
+    await chat.start_chat("other", "o", [])
+    await sessions.get("other").task
+    (foreign,) = await _user_ids("other")
     with pytest.raises(chat.RewindError):
-        await chat._rewind("s", assistant.id)
-    with pytest.raises(chat.RewindError):
-        await chat._rewind("s", 9999)
-
-    # 旧数据:没有记录过 checkpoint
-    await persist_user_turn("old", "p", "legacy", [])
-    (legacy,) = await _user_ids("old")
-    with pytest.raises(chat.RewindError, match="cannot be rewound"):
-        await chat._rewind("old", legacy)
+        await chat.start_chat("s", "x", [], rewind_to_message_id=foreign)
+    assert [m.content for m in await repository.get_messages("s")] == ["a", "done"]
 
 
-async def test_rewind_rejects_message_of_another_conversation(db, agent):
-    await _turn(agent, "s", "a")
-    (mid,) = await _user_ids("s")
-    with pytest.raises(chat.RewindError):
-        await chat._rewind("other", mid)
+async def test_rewind_rejects_legacy_message_without_checkpoint(rewind_runtime):
+    await seed_legacy_turn("s", "legacy", "old")
+    (legacy,) = await _user_ids("s")
+    with pytest.raises(chat.RewindError, match="不能回退"):
+        await chat.start_chat("s", "x", [], rewind_to_message_id=legacy)

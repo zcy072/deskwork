@@ -31,6 +31,19 @@ function setup() {
   return { chat, wrapper: mount(Host, { attachTo: document.body }) }
 }
 
+/** 打开第 i 个会话的“更多”菜单并点其中一项 */
+async function pickAction(wrapper: ReturnType<typeof mount>, i: number, label: string) {
+  await wrapper.findAll('.actions .more')[i].trigger('click')
+  await nextTick()
+  const opt = await vi.waitFor(() => {
+    const o = [...document.querySelectorAll('.n-dropdown-option')].find((el) => el.textContent?.trim() === label)
+    if (!o) throw new Error(`菜单项 ${label} 未出现`)
+    return o as HTMLElement
+  })
+  opt.querySelector<HTMLElement>('.n-dropdown-option-body')!.click()
+  await nextTick()
+}
+
 describe('Sidebar', () => {
   beforeEach(() => {
     document.body.innerHTML = ''
@@ -95,16 +108,15 @@ describe('Sidebar', () => {
 
   it('备份按钮下载对应会话的 zip', async () => {
     const { wrapper } = setup()
-    const backup = wrapper.findAll('.actions button').filter((b) => b.text() === '备份')
-    expect(backup.length).toBe(2)
-    await backup[1].trigger('click')
-    expect(downloadSessionArchive).toHaveBeenCalledWith('c2')
+    expect(wrapper.findAll('.actions .more').length).toBe(2)
+    await pickAction(wrapper, 1, '备份(zip)')
+    expect(downloadSessionArchive).toHaveBeenCalledWith('c2', '会话二')
   })
 
   it('导入备份:上传所选文件并打开新会话', async () => {
     const { chat, wrapper } = setup()
     vi.mocked(importSessionArchive).mockResolvedValue({
-      id: 'new1', title: '旧会话', message_count: 2, file_count: 0, missing: [], resumable: true, warnings: [],
+      id: 'new1', title: '旧会话', message_count: 2, file_count: 0, missing: [],
     })
     const refresh = vi.spyOn(chat, 'refreshConversations').mockResolvedValue()
     const open = vi.spyOn(chat, 'openConversation').mockResolvedValue()
@@ -117,15 +129,14 @@ describe('Sidebar', () => {
     expect(refresh).toHaveBeenCalled()
   })
 
-  it('重命名和删除是按钮,键盘可达;重命名 Enter 提交', async () => {
+  it('操作收在“更多”按钮菜单里;重命名 Enter 提交', async () => {
     const { chat, wrapper } = setup()
     const rename = vi.spyOn(chat, 'rename').mockResolvedValue()
-    const actions = wrapper.findAll('.actions button')
-    expect(actions.length).toBe(8) // 每个会话 重命名 + 删除 + 导出 + 备份
-    expect(actions[0].text()).toBe('重命名')
-    expect(actions[1].text()).toBe('删除')
+    const more = wrapper.findAll('.actions button')
+    expect(more.length).toBe(2) // 每个会话只有一个“更多”按钮,标题不被挤占
+    expect(more[0].attributes('aria-label')).toBe('更多操作')
 
-    await actions[0].trigger('click')
+    await pickAction(wrapper, 0, '重命名')
     const input = wrapper.find('.item input')
     expect(input.exists()).toBe(true)
     await input.setValue('新名字')
@@ -135,11 +146,36 @@ describe('Sidebar', () => {
     wrapper.unmount()
   })
 
+  it('改名时按 Esc 放弃,不提交;没改动也不提交', async () => {
+    const { chat, wrapper } = setup()
+    const rename = vi.spyOn(chat, 'rename').mockResolvedValue()
+    await pickAction(wrapper, 0, '重命名')
+    const input = wrapper.find('.item input')
+    await input.setValue('不要的名字')
+    await input.trigger('keydown', { key: 'Escape' })
+    await input.trigger('blur')
+    await nextTick()
+    expect(wrapper.find('.item input').exists()).toBe(false)
+
+    await pickAction(wrapper, 0, '重命名')
+    await wrapper.find('.item input').trigger('keydown', { key: 'Enter' })
+    await nextTick()
+    expect(rename).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('标题为空的会话显示“未命名对话”', async () => {
+    const { chat, wrapper } = setup()
+    chat.conversations = [{ id: 'c3', title: '', message_count: 1, created_at: '', updated_at: '' }]
+    await nextTick()
+    expect(wrapper.find('.item .title').text()).toBe('未命名对话')
+    wrapper.unmount()
+  })
+
   it('点删除先弹确认,确认后才删除', async () => {
     const { chat, wrapper } = setup()
     const remove = vi.spyOn(chat, 'removeConversation').mockResolvedValue()
-    await wrapper.findAll('.actions button')[1].trigger('click')
-    await nextTick()
+    await pickAction(wrapper, 0, '删除')
     expect(remove).not.toHaveBeenCalled()
     const confirm = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === '删除' && b.closest('.n-dialog'))
     expect(confirm).toBeTruthy()

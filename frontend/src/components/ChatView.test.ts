@@ -1,16 +1,21 @@
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
-vi.mock('@/api/client', () => ({}))
+vi.mock('@/api/client', () => ({
+  getCapabilities: vi.fn().mockResolvedValue({ memory: false, memory_confirm_writes: false, mcp_servers: {}, upload_limits: { max_files: 2, max_file_mb: 1, max_total_mb: 2 } }),
+}))
 import { useChatStore } from '@/stores/chat'
+import { NMessageProvider } from 'naive-ui'
+import { defineComponent, h } from 'vue'
 import ChatView from './ChatView.vue'
 
 function setup() {
   setActivePinia(createPinia())
   const chat = useChatStore()
-  const wrapper = mount(ChatView, { attachTo: document.body })
+  const Host = defineComponent({ render: () => h(NMessageProvider, null, { default: () => h(ChatView) }) })
+  const wrapper = mount(Host, { attachTo: document.body })
   return { chat, wrapper }
 }
 
@@ -20,6 +25,22 @@ describe('ChatView 输入框', () => {
   beforeEach(() => {
     document.body.innerHTML = ''
     HTMLElement.prototype.scrollTo = vi.fn()
+  })
+
+  it('选文件时按服务端上限过滤,超限的当场提示', async () => {
+    const { chat, wrapper } = setup()
+    await flushPromises()
+    const big = new File([new Uint8Array(2 * 1024 * 1024)], 'big.pdf')
+    const ok1 = new File(['a'], 'a.txt')
+    const ok2 = new File(['b'], 'b.txt')
+    const extra = new File(['c'], 'c.txt')
+    const input = wrapper.find('input[type=file]')
+    Object.defineProperty(input.element, 'files', { value: [big, ok1, ok2, extra], configurable: true })
+    await input.trigger('change')
+    expect(chat.draftFor().files.map((f) => f.name)).toEqual(['a.txt', 'b.txt'])
+    await vi.waitFor(() => expect(document.body.textContent).toContain('big.pdf'))
+    expect(document.body.textContent).toContain('一次最多 2 个文件')
+    wrapper.unmount()
   })
 
   it('Enter 发送;输入法组合中的 Enter(isComposing / keyCode 229)不发送', async () => {
@@ -218,7 +239,7 @@ describe('ChatView 待重选附件提示', () => {
     first.persistDraft()
 
     setActivePinia(createPinia())
-    const wrapper = mount(ChatView, { attachTo: document.body })
+    const wrapper = mount(defineComponent({ render: () => h(NMessageProvider, null, { default: () => h(ChatView) }) }), { attachTo: document.body })
     expect(wrapper.find('.lost').text()).toContain('report.pdf')
 
     await wrapper.find('.lost button').trigger('click')

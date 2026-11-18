@@ -22,6 +22,7 @@ from app.sandbox.constants import (
     SESSION_SUBDIRS,
     VIRTUAL_WORKSPACE,
 )
+from app.sandbox.host_files import parent_fd
 
 
 def normalize_virtual_root(virtual_root: str) -> str:
@@ -140,6 +141,11 @@ class SessionPaths:
             return self._resolve_global_path(DEFAULT_SKILLS_DIR, rel)
         return self.resolve_host_path(rel)
 
+    def trusted_root(self, virtual_path: str) -> Path:
+        """The root a host-side open must start from: session dir or global skills dir."""
+        is_skills, _ = self._resolve_virtual(virtual_path)
+        return DEFAULT_SKILLS_DIR if is_skills else self.session_root
+
     def virtual_to_container_path(self, virtual_path: str) -> str:
         """Map /workspace/... to the physical container path for docker exec.
 
@@ -214,7 +220,7 @@ class SessionPaths:
 
         沙箱里的命令能把产物换成指向后端自身文件(如 /proc/1/environ、data/ 下的数据库)的链接,
         直接 read_text 会把后端的内容读出来交给模型。末段用 O_NOFOLLOW 拒绝链接,
-        中间各段由 resolve 后的前缀检查保证仍在会话目录内。
+        中间各段通过目录 fd 打开,拒绝路径解析后被替换的符号链接。
         """
         with self.open_host_file(host_path) as fh:
             return fh.read() if max_bytes is None else fh.read(max_bytes)
@@ -225,7 +231,10 @@ class SessionPaths:
         parent = host_path.parent.resolve()
         if parent != root and not parent.is_relative_to(root):
             raise ValueError(f"Path '{host_path}' escapes session directory")
-        fd = os.open(parent / host_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # Do not use the newly resolved parent to open the file: a replaced
+        # directory could redirect a previously validated output path elsewhere.
+        with parent_fd(root, host_path) as (directory, name):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
             raise ValueError(f"Not a regular file: {host_path.name}")

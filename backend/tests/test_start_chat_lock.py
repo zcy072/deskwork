@@ -1,49 +1,38 @@
-"""start_chat:并发双击只放行一个;启动中途失败要把状态从 running 改回去。"""
+"""start_chat:并发双击只放行一个;启动中途失败要把运行回执收尾;_run_agent 的落库顺序。"""
 
 import asyncio
 
 import pytest
 
+from app.db import repository
 from app.services import chat_operations as ops
+from tests.history_seed import run_turn
 
 _real_launch = ops._launch_agent_task
 
 
 @pytest.fixture
-def stubbed(monkeypatch):
-    calls = {"launched": 0, "status": []}
-
-    async def get_status(_sid):
-        await asyncio.sleep(0.01)  # 模拟 Redis 往返,给并发请求插队的机会
-        return "complete"
-
-    async def set_status(_sid, status):
-        calls["status"].append(status)
+async def stubbed(run_db, monkeypatch):
+    calls = {"launched": 0, "finished": []}
 
     async def noop(*_a, **_k):
         return None
 
     async def upload(_sid, _uploads):
+        await asyncio.sleep(0)
         return []
 
-    monkeypatch.setattr(ops, "get_thread_status", get_status)
-    monkeypatch.setattr(ops, "set_thread_status", set_status)
-    monkeypatch.setattr(ops, "register_prompt", noop)
+    async def finished(pid):
+        calls["finished"].append(pid)
+
     monkeypatch.setattr(ops, "_push", noop)
-    monkeypatch.setattr(ops, "persist_user_turn", noop)
     monkeypatch.setattr(ops, "upload_session_files", upload)
-
-    async def done(pid):
-        calls["done"].append(pid)
-
-    calls["done"] = []
-    monkeypatch.setattr(ops, "mark_done", done)
+    monkeypatch.setattr(ops, "finish_existing_stream", finished)
     monkeypatch.setattr(
         ops,
         "_launch_agent_task",
         lambda *a, **k: calls.__setitem__("launched", calls["launched"] + 1),
     )
-    ops._starting_sessions.discard("s1")
     return calls
 
 
@@ -55,42 +44,35 @@ async def test_concurrent_start_only_one_wins(stubbed):
     assert stubbed["launched"] == 1
 
 
-async def test_failure_after_running_resets_status(stubbed, monkeypatch):
-    async def boom(*_a, **_k):
-        raise RuntimeError("redis down")
+async def test_failure_after_accept_records_error_and_closes_stream(stubbed, monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("launch failed")
 
-    monkeypatch.setattr(ops, "persist_user_turn", boom)
+    monkeypatch.setattr(ops, "_launch_agent_task", boom)
     with pytest.raises(RuntimeError):
         await ops.start_chat("s1", "hi", [])
-    assert stubbed["status"] == ["running", "error"]
-    assert "s1" not in ops._starting_sessions
-    # 已推过事件的流要收尾(设过期),登记的 prompt_id 也要清掉
-    assert len(stubbed["done"]) == 1
+    (prompt_id,) = stubbed["finished"]
+    run = await ops.run_store.get(prompt_id)
+    assert (run.status, run.error_code) == ("error", "admission_interrupted")
+    assert ops.sessions.get("s1") is None
     assert ops.get_active_prompt_id("s1") is None
 
 
 async def test_cancel_during_startup_waits_for_task(stubbed, monkeypatch):
     """取消落在快照/写库期间:不报 409,等任务建起来后取消它;期间 prompt_id 可查到。"""
-    status = {"s1": "complete"}
     gate = asyncio.Event()
     started = asyncio.Event()
+    real_accept = ops.run_store.accept
 
-    async def get_status(sid):
-        return status.get(sid)
-
-    async def set_status(sid, s):
-        status[sid] = s
-
-    async def slow_persist(*_a, **_k):
+    async def slow_accept(*args, **kwargs):
         started.set()
         await gate.wait()
+        return await real_accept(*args, **kwargs)
 
     async def run_forever(*_a, **_k):
         await asyncio.sleep(999)
 
-    monkeypatch.setattr(ops, "get_thread_status", get_status)
-    monkeypatch.setattr(ops, "set_thread_status", set_status)
-    monkeypatch.setattr(ops, "persist_user_turn", slow_persist)
+    monkeypatch.setattr(ops.run_store, "accept", slow_accept)
     monkeypatch.setattr(ops, "_run_agent", run_forever)
     monkeypatch.setattr(ops, "_launch_agent_task", _real_launch)
 
@@ -104,32 +86,36 @@ async def test_cancel_during_startup_waits_for_task(stubbed, monkeypatch):
     prompt_id = await start
     _, cancelled = await cancel
     assert cancelled
-    assert prompt_id not in ops._active_prompt_ids.values()
+    assert ops.get_active_prompt_id("s1") is None
+    assert (await ops.run_store.get(prompt_id)).status == "cancelled"
 
 
-async def test_upload_failure_does_not_rewind(stubbed, monkeypatch):
+async def test_upload_failure_leaves_history_untouched(stubbed, monkeypatch):
     order = []
 
     async def check(_sid, _mid):
         order.append("check")
 
-    async def rewind(_sid, _mid):
-        order.append("rewind")
-        return []
-
     async def bad_upload(_sid, _uploads):
         order.append("upload")
         raise RuntimeError("manager down")
 
+    async def reused(*_a):
+        order.append("reused")
+        return []
+
     monkeypatch.setattr(ops, "_check_rewind_target", check)
-    monkeypatch.setattr(ops, "_rewind", rewind)
+    monkeypatch.setattr(ops.rewind_service, "reused_files", reused)
     monkeypatch.setattr(ops, "upload_session_files", bad_upload)
     with pytest.raises(RuntimeError):
-        await ops.start_chat("s1", "hi", [], rewind_to_message_id=1)
-    assert order == ["check", "upload"]  # 上传失败时历史和 checkpoint 原样保留
+        await ops.start_chat(
+            "s1", "hi", [], rewind_to_message_id=1, rewind_mode="conversation_only"
+        )
+    assert order == ["check", "upload"]  # 上传失败时不会读取/截断历史
+    assert stubbed["launched"] == 0
 
 
-async def test_started_marker_is_per_prompt(monkeypatch):
+async def test_started_marker_is_per_prompt(run_db, monkeypatch):
     class Boom:
         def __getattr__(self, _):
             raise RuntimeError("no agent")
@@ -138,94 +124,37 @@ async def test_started_marker_is_per_prompt(monkeypatch):
         return None
 
     monkeypatch.setattr(ops, "get_agent", lambda: Boom())
-    monkeypatch.setattr(ops, "set_thread_status", noop)
     monkeypatch.setattr(ops, "_push", noop)
-    monkeypatch.setattr(ops, "persist_assistant_turn", noop)
-    monkeypatch.setattr(ops, "mark_done", noop)
-    ops._started_prompts.add("other-prompt")
-    await ops._run_agent("p-new", "s1", "q")
-    assert ops._started_prompts == {"other-prompt"}
-    ops._started_prompts.discard("other-prompt")
+    other = ops.sessions.reserve("other")
+    other.prompt_id = "other-prompt"
+    await run_turn("s1", "p-new", "q")
+    assert ops.sessions.get("other") is other
+    ops.sessions.release(other)
 
 
-async def test_assistant_turn_persisted_before_status_complete(monkeypatch):
-    order = []
+class _Snapshot:
+    interrupts = ()
+    tasks = ()
+    metadata = {}
+    values = {"messages": []}
+    config = {"configurable": {}}
 
-    async def status(_sid, s):
-        order.append(f"status:{s}")
 
-    async def persist(*_a, **_k):
-        order.append("persist")
-        return True
-
-    async def noop(*_a, **_k):
-        return None
-
-    class Snapshot:
-        interrupts = ()
-        values = {"messages": []}
-        config = {"configurable": {}}
-
+def _agent(*chunks):
     class FakeAgent:
         async def aget_state(self, _c):
-            return Snapshot()
+            return _Snapshot()
 
         async def astream(self, *_a, **_k):
-            if False:
-                yield None
+            for chunk in chunks:
+                yield chunk
 
-    monkeypatch.setattr(ops, "get_agent", lambda: FakeAgent())
-    monkeypatch.setattr(ops, "set_thread_status", status)
-    monkeypatch.setattr(ops, "persist_assistant_turn", persist)
-    monkeypatch.setattr(ops, "_push", noop)
-    monkeypatch.setattr(ops, "mark_done", noop)
-    monkeypatch.setattr(ops, "_record_checkpoint", noop)
-    await ops._run_agent("p1", "s1", "q")
-    assert order == ["persist", "status:complete"]
+    return FakeAgent()
 
 
-async def test_tool_result_checkpoints_running_turn(monkeypatch):
-    saved = []
-
-    async def persist(_sid, _pid, recorder, status, *_a, **_k):
-        saved.append((status, [p["type"] for p in recorder.parts]))
-
-    async def noop(*_a, **_k):
-        return None
-
-    class Snapshot:
-        interrupts = ()
-        values = {"messages": []}
-        config = {"configurable": {}}
-
-    class FakeAgent:
-        async def aget_state(self, _c):
-            return Snapshot()
-
-        async def astream(self, *_a, **_k):
-            yield ("custom", {"event": "tool.result", "data": {"id": "c1", "content": "ok"}})
-
-    monkeypatch.setattr(ops, "get_agent", lambda: FakeAgent())
-    monkeypatch.setattr(ops, "set_thread_status", noop)
-    monkeypatch.setattr(ops, "persist_assistant_turn", persist)
-    monkeypatch.setattr(ops, "_push", noop)
-    monkeypatch.setattr(ops, "mark_done", noop)
-    monkeypatch.setattr(ops, "_record_checkpoint", noop)
-    monkeypatch.setattr(ops, "_normalize_custom", lambda d: (d["event"], d["data"]))
-    await ops._run_agent("p1", "s1", "q")
-    assert saved[0] == ("running", ["tool_result"])
-    assert saved[-1][0] == "complete"
-
-
-async def test_terminal_save_failure_is_reported_not_complete(monkeypatch):
-    """B2:终态写库失败时,不能报 complete,要有可见的错误事件。"""
-    statuses, events = [], []
-
-    async def status(_sid, s):
-        statuses.append(s)
-
-    async def persist(*_a, **_k):
-        return False
+@pytest.fixture
+def runner(run_db, monkeypatch):
+    events = []
 
     async def push(_pid, event, _data):
         events.append(event)
@@ -233,73 +162,107 @@ async def test_terminal_save_failure_is_reported_not_complete(monkeypatch):
     async def noop(*_a, **_k):
         return None
 
-    class Snapshot:
-        interrupts = ()
-        values = {"messages": []}
-        config = {"configurable": {}}
-
-    class FakeAgent:
-        async def aget_state(self, _c):
-            return Snapshot()
-
-        async def astream(self, *_a, **_k):
-            if False:
-                yield None
-
-    monkeypatch.setattr(ops, "get_agent", lambda: FakeAgent())
-    monkeypatch.setattr(ops, "set_thread_status", status)
-    monkeypatch.setattr(ops, "persist_assistant_turn", persist)
     monkeypatch.setattr(ops, "_push", push)
-    monkeypatch.setattr(ops, "mark_done", noop)
-    monkeypatch.setattr(ops, "_record_checkpoint", noop)
-    await ops._run_agent("p1", "s1", "q")
-    assert "complete" not in statuses and statuses[-1] == "error"
-    assert "error" in events and events[-1] == "stream.end"
+    monkeypatch.setattr(ops, "_repair_cancelled_tool_calls", noop)
+    monkeypatch.setattr(ops.CONTAINER_MANAGER, "snapshot_session", noop)
+    return events
+
+
+async def test_terminal_receipt_saved_before_stream_end(runner, monkeypatch):
+    order = []
+    real_save = ops.run_store.save
+
+    async def save(*args, **kwargs):
+        await real_save(*args, **kwargs)
+        order.append(f"save:{args[5]}")
+
+    async def finished(_pid):
+        order.append("stream.end")
+
+    monkeypatch.setattr(ops, "get_agent", lambda: _agent())
+    monkeypatch.setattr(ops.run_store, "save", save)
+    monkeypatch.setattr(ops, "finish_existing_stream", finished)
+    await run_turn("s1", "p1", "q")
+    assert order == ["save:complete", "stream.end"]
+
+
+async def test_tool_result_checkpoints_running_turn(runner, monkeypatch):
+    saved = []
+    real_save = ops.run_store.save
+
+    async def save(run_id, parts, *rest, **kwargs):
+        saved.append((rest[3] if len(rest) > 3 else "running", [p["type"] for p in parts]))
+        return await real_save(run_id, parts, *rest, **kwargs)
+
+    chunk = ("custom", {"event": "tool.result", "data": {"id": "c1", "content": "ok"}})
+    monkeypatch.setattr(ops, "get_agent", lambda: _agent(chunk))
+    monkeypatch.setattr(ops.run_store, "save", save)
+    monkeypatch.setattr(ops, "_normalize_custom", lambda d: (d["event"], d["data"]))
+    run = await run_turn("s1", "p1", "q")
+    assert saved[0] == ("running", ["tool_result"])
+    assert saved[-1][0] == "complete" and run.status == "complete"
+    message = await ops.run_store.message("p1")
+    assert [p["type"] for p in message.parts] == ["tool_result"]
+
+
+async def test_terminal_save_failure_is_reported_not_complete(runner, monkeypatch):
+    """B2:终态写库失败时,不能报 complete,要有可见的错误事件。"""
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ops, "get_agent", lambda: _agent())
+    monkeypatch.setattr(ops.run_store, "save", broken)
+    run = await run_turn("s1", "p1", "q")
+    assert run.status != "complete"
+    assert (await repository.get_conversation("s1")).last_run_status != "complete"
+    assert "error" in runner and runner[-1] == "stream.end"
 
 
 async def test_startup_failure_does_not_rewind(stubbed, monkeypatch):
     """B5:回退是破坏性的,启动中途失败时历史和 checkpoint 必须原样保留。"""
-    rewound = []
+    touched = []
 
     async def check(_sid, _mid):
         return None
 
-    async def rewind(_sid, _mid):
-        rewound.append(1)
+    async def reused(*_a):
         return []
 
-    async def files(_mid):
-        return []
+    async def prepare(*_a, **_k):
+        touched.append("prepare")
 
     async def boom(*_a, **_k):
         raise RuntimeError("redis down")
 
     monkeypatch.setattr(ops, "_check_rewind_target", check)
-    monkeypatch.setattr(ops, "_rewind", rewind)
-    monkeypatch.setattr(ops.repository, "get_message_files", files)
+    monkeypatch.setattr(ops.rewind_service, "reused_files", reused)
+    monkeypatch.setattr(ops.rewind_service, "prepare", prepare)
     monkeypatch.setattr(ops, "_push", boom)
     with pytest.raises(RuntimeError):
-        await ops.start_chat("s1", "hi", [], rewind_to_message_id=1)
-    assert rewound == []
+        await ops.start_chat(
+            "s1", "hi", [], rewind_to_message_id=1, rewind_mode="conversation_only"
+        )
+    assert touched == [] and stubbed["launched"] == 0
 
 
-async def test_delete_refused_while_starting(monkeypatch):
+async def test_delete_refused_while_starting(run_db):
     """B6:启动中的会话不能被删除,删除期间也不能启动。"""
     from app.services import conversation_cleanup as cc
 
-    ops._starting_sessions.add("s2")
+    starting = ops.sessions.reserve("s2")
     try:
         with pytest.raises(ops.ActiveRunError):
             await cc.delete_conversation_data("s2")
     finally:
-        ops._starting_sessions.discard("s2")
+        ops.sessions.release(starting)
 
-    ops._deleting_sessions.add("s3")
+    deleting = ops.sessions.reserve("s3", "delete")
     try:
         with pytest.raises(ops.ActiveRunError):
             await ops.start_chat("s3", "hi", [])
     finally:
-        ops._deleting_sessions.discard("s3")
+        ops.sessions.release(deleting)
 
 
 async def test_same_request_id_returns_original_prompt(stubbed):
@@ -311,15 +274,14 @@ async def test_same_request_id_returns_original_prompt(stubbed):
 
 async def test_request_id_with_different_content_is_rejected(stubbed):
     await ops.start_chat("s1", "hi", [], client_request_id="r2")
-    with pytest.raises(ops.RequestIdConflictError):
+    with pytest.raises(ops.run_store.RequestIdConflictError):
         await ops.start_chat("s1", "other", [], client_request_id="r2")
     assert stubbed["launched"] == 1
 
 
-async def test_request_id_is_scoped_to_owner(stubbed):
+async def test_request_id_is_scoped_to_session(stubbed):
     a = await ops.start_chat("s1", "hi", [], owner="a", client_request_id="r3")
-    ops._active_agent_tasks.pop("s1", None)
-    b = await ops.start_chat("s1", "hi", [], owner="b", client_request_id="r3")
+    b = await ops.start_chat("s2", "hi", [], owner="b", client_request_id="r3")
     assert a != b
     assert stubbed["launched"] == 2
 
@@ -328,7 +290,16 @@ async def test_failed_start_is_not_remembered(stubbed, monkeypatch):
     async def boom(*_a, **_k):
         raise RuntimeError("redis down")
 
-    monkeypatch.setattr(ops, "persist_user_turn", boom)
+    monkeypatch.setattr(ops.run_store, "accept", boom)
     with pytest.raises(RuntimeError):
         await ops.start_chat("s1", "hi", [], client_request_id="r4")
-    assert ("", "s1", "r4") not in ops._accepted_requests
+    assert await ops.run_store.accepted("s1", "", "r4", "") is None
+
+
+async def test_file_only_message_titles_conversation_with_file_names(stubbed):
+    from app.services.file_operations import InMemoryUpload
+
+    uploads = [InMemoryUpload("季度报表.xlsx", b"x"), InMemoryUpload("说明.docx", b"y")]
+    await ops.start_chat("s-files", "   ", uploads)
+    conv = await repository.get_conversation("s-files")
+    assert conv.title == "季度报表.xlsx、说明.docx"
